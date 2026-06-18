@@ -1,0 +1,7 @@
+# Extra dependency on top of the production stack (requirements.prod.txt).
+# EasyOCR drives the per-booth OCR fallback in pdf_hybrid_pipeline.py.
+# All of EasyOCR's own dependencies (torch, torchvision, opencv-python-headless,
+# scikit-image, scipy, numpy, Pillow, PyYAML, Shapely, pyclipper, python-bidi,
+# ninja) are already pinned in requirements.prod.txt, so installing this last
+# does not move any of those versions.
+easyocr==1.7.2

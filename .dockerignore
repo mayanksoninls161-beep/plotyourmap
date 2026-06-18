@@ -1,0 +1,15 @@
+# Keep the build context small and never ship secrets or runtime data.
+.env
+.env.*
+!.env.example
+data/
+**/data/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+*.log
+logs/
+app/**/results/
+app/**/out/
+.git/
+.venv/

@@ -1,0 +1,71 @@
+# ============================================================================
+# Adaptive Booth API — Docker Compose (self-contained image)
+# ----------------------------------------------------------------------------
+# All app + engine + detector code is BAKED INTO the image (see Dockerfile).
+# The only external file is ./.env (your keys). Copy .env.example -> .env and
+# fill it in before the first run.
+#
+#   docker compose build
+#   docker compose up -d api               # API on :8000 (override API_PORT)
+#   curl -fsS localhost:8000/health
+#
+# Optional one-shot CLI (no Roboflow keys needed): put a file in ./data/in and
+#   docker compose run --rm booth-cli /data/in/<file>.pdf --outdir /data/out
+#
+# Endpoints (send header  Authentication-API-Key: <AUTHENTICATION_API_KEY>):
+#   POST /predict                  icons + trails (Roboflow)
+#   POST /debug_predict            trail debug (Roboflow)
+#   POST /hall_with_booth_predict  Roboflow hall + ADAPTIVE booths; accepts
+#                                  image_url and/or pdf_url (PDF wins when both)
+# ============================================================================
+
+services:
+  api:
+    build:
+      context: .
+    image: adaptive-booth-api:latest
+    container_name: adaptive-booth-api
+    working_dir: /app
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file:
+      - .env
+    environment:
+      S3_WRITEBACK_ENABLED: "false"          # constraint: keep S3 OFF
+      ONNXRUNTIME_EXECUTION_PROVIDERS: "CPUExecutionProvider"
+      OMP_NUM_THREADS: "4"
+      HALL_RASTER_MAX_EDGE: "2048"
+      LOG_DIR: "/data/logs"
+      HASH_DB_PATH: "/data/hash_db.json"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./data:/data
+      - model-cache:/root/.cache             # persist Roboflow/HF model downloads
+      - easyocr-cache:/root/.EasyOCR         # persist EasyOCR model download
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 180s                     # first boot may load remote models
+    restart: unless-stopped
+
+  booth-cli:
+    build:
+      context: .
+    image: adaptive-booth-api:latest         # same image as api; built once
+    container_name: adaptive-booth-cli
+    working_dir: /app/adaptive
+    entrypoint: ["python", "/app/adaptive/pipeline.py"]
+    command: ["--help"]                       # overridden by `docker compose run` args
+    environment:
+      OMP_NUM_THREADS: "4"
+      LOG_DIR: "/data/logs"
+    volumes:
+      - ./data:/data
+      - easyocr-cache:/root/.EasyOCR
+    profiles: ["cli"]                          # not started by `up`; use `run`
+
+volumes:
+  model-cache:
+  easyocr-cache:
