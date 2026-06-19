@@ -439,6 +439,17 @@ def _hall_predictions_render_space(render_bgr, hall_conf: float,
                 for k in ("x", "y", "width", "height"):
                     if isinstance(p.get(k), (int, float)):
                         p[k] = p[k] * inv
+                # Instance-segmentation polygons live in the downscaled hall
+                # raster's pixel space too -- scale them back alongside the
+                # bbox, else any consumer that uses `points` (e.g. polygon
+                # overlays, hall<->booth containment) gets halls shrunk and
+                # shifted toward the origin on plans rendered wider than max_edge.
+                for pt in p.get("points", []) or []:
+                    if isinstance(pt, dict):
+                        if isinstance(pt.get("x"), (int, float)):
+                            pt["x"] = pt["x"] * inv
+                        if isinstance(pt.get("y"), (int, float)):
+                            pt["y"] = pt["y"] * inv
             img = block.get("image")
             if isinstance(img, dict):
                 img["width"], img["height"] = w, h
