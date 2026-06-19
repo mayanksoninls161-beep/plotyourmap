@@ -498,16 +498,32 @@ def _build_hall_booth_map(hall_predictions: list, booth_detections: dict) -> dic
             x1, y1, x2, y2 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
             halls.append({
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "area": float(w) * float(h),
                 "coordinates": [[x1, y1], [x2, y1], [x2, y2], [x1, y2], [x1, y1]],
             })
 
     booths = booth_detections.get("booths", [])
+
+    # A real sub-booth is SMALLER than the hall that contains it. A "booth" whose
+    # area is >= this fraction of its hall's area is not a sub-booth -- it's a
+    # big merged region (often the hall block itself), so it is NOT nested under
+    # the hall and falls through to "Other" instead.
+    MAX_BOOTH_HALL_AREA_FRAC = 0.5
 
     def _label_booth(b: dict) -> dict:
         b = dict(b)
         if "name" in b:
             b["id"] = b.pop("name")
         return b
+
+    def _booth_area(b: dict) -> float:
+        a = b.get("area")
+        if isinstance(a, (int, float)) and a > 0:
+            return float(a)
+        bb = b.get("bbox")
+        if isinstance(bb, (list, tuple)) and len(bb) >= 4:
+            return float(bb[2]) * float(bb[3])
+        return 0.0
 
     hall_groups = [[] for _ in halls]
     other_booths = []
@@ -520,6 +536,10 @@ def _build_hall_booth_map(hall_predictions: list, booth_detections: dict) -> dic
         assigned = False
         for idx, hall in enumerate(halls):
             if hall["x1"] <= cx <= hall["x2"] and hall["y1"] <= cy <= hall["y2"]:
+                # size gate: skip booths too large to be a sub-booth of this hall
+                ha = hall.get("area", 0.0)
+                if ha > 0 and _booth_area(booth) >= MAX_BOOTH_HALL_AREA_FRAC * ha:
+                    break  # treat as "Other" rather than nesting an oversized box
                 hall_groups[idx].append(_label_booth(booth))
                 assigned = True
                 break
