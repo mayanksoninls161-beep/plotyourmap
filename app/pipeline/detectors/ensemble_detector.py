@@ -106,6 +106,11 @@ class EnsembleDetector:
         geometric / color / bordered : inject pre-configured detector instances;
             when None the package defaults (already hyper-tuned) are used.
         """
+        logger.debug("__init__() called with use_geometric=%s, use_color=%s, use_bordered=%s, "
+                     "iou_threshold=%s, bordered_min_area_frac=%s, max_box_area_frac=%s, "
+                     "demerge_with_bordered=%s",
+                     use_geometric, use_color, use_bordered, iou_threshold,
+                     bordered_min_area_frac, max_box_area_frac, demerge_with_bordered)
         if not (use_geometric or use_color or use_bordered):
             raise ValueError("EnsembleDetector needs at least one pass enabled "
                              "(use_geometric, use_color and/or use_bordered).")
@@ -122,6 +127,7 @@ class EnsembleDetector:
 
     @staticmethod
     def _xyxy(b: Dict) -> List[float]:
+        logger.debug("_xyxy() called with bbox=%s", b.get("bbox"))
         x, y, w, h = b["bbox"]
         return [x, y, x + w, y + h]
 
@@ -129,6 +135,7 @@ class EnsembleDetector:
     def _poly(b: Dict):
         """Oriented quad (open, >=3 pts) from a booth's `coordinates`, for
         rotated-IoU fusion. Returns None when no usable polygon is present."""
+        logger.debug("_poly() called with source=%s", b.get("source"))
         c = b.get("coordinates")
         if not c:
             return None
@@ -142,6 +149,7 @@ class EnsembleDetector:
     def _run_pass(self, name: str, detector, image_path: str) -> List[Dict]:
         """Run one sub-detector. A failure in one pass must not sink the other,
         so we log and degrade to an empty result instead of propagating."""
+        logger.debug("_run_pass() called for name=%s, image_path=%s", name, image_path)
         try:
             out = detector.detect(image_path)
             logger.info("ensemble: %s pass -> %d regions", name, len(out))
@@ -151,11 +159,15 @@ class EnsembleDetector:
             return []
 
     def detect(self, image_path: str) -> List[Dict]:
+        logger.debug("detect() called with image_path=%s (geometric=%s, color=%s, bordered=%s)",
+                     image_path, self.use_geometric, self.use_color, self.use_bordered)
         geo = self._run_pass("geometric", self.geometric, image_path) if self.use_geometric else []
         col = self._run_pass("color", self.color, image_path) if self.use_color else []
         bor = self._run_pass("bordered", self.bordered, image_path) if self.use_bordered else []
 
         pool = list(geo) + list(col) + list(bor)
+        logger.debug("detect: pooled candidates geo=%d + color=%d + bordered=%d -> pool=%d",
+                     len(geo), len(col), len(bor), len(pool))
 
         # Image area, read once, shared by every size-based fusion guard below.
         img_area = None
@@ -165,6 +177,7 @@ class EnsembleDetector:
             _img = cv2.imread(image_path)
             if _img is not None:
                 img_area = float(_img.shape[0] * _img.shape[1])
+                logger.debug("detect: img_area=%.0f read for size-based fusion guards", img_area)
 
         # Prune hall-sized GEOMETRIC/COLOR boxes BEFORE fusion. Such a box (e.g.
         # a hall outline traced as one "booth") would be kept first by NMS
@@ -183,6 +196,8 @@ class EnsembleDetector:
                         continue
                 pruned.append(b)
             pool = pruned
+            logger.debug("detect: pre-fusion prune dropped %d oversized geo/color boxes -> pool=%d",
+                         dropped_oversized, len(pool))
 
         # De-merge GEOMETRIC/COLOR boxes that the BORDERED pass has already split.
         # The color mask's closing fuses abutting same-fill booths into one
@@ -223,6 +238,8 @@ class EnsembleDetector:
                     continue                      # drop the merged box
                 kept_pool.append(b)
             pool = kept_pool
+            logger.debug("detect: de-merge dropped %d merged geo/color boxes split by bordered tiles -> pool=%d",
+                         demerged, len(pool))
 
         nms_in = []
         for b in pool:
@@ -233,11 +250,13 @@ class EnsembleDetector:
             if poly is not None:
                 entry["poly"] = poly          # rotated-IoU when available
             nms_in.append(entry)
-        
 
 
+        logger.debug("detect: running NMS on %d boxes (iou_threshold=%s)",
+                     len(nms_in), self.iou_threshold)
         kept = non_max_suppression(nms_in, iou_threshold=self.iou_threshold)
         fused = [k["_ref"] for k in kept]
+        logger.debug("detect: NMS kept %d of %d boxes", len(fused), len(nms_in))
 
 
 
@@ -253,6 +272,8 @@ class EnsembleDetector:
                         continue
                 filtered.append(b)
             fused = filtered
+            logger.debug("detect: post-fusion filter dropped %d small bordered boxes -> %d kept",
+                         dropped_small_bordered, len(fused))
 
         for i, b in enumerate(fused, 1):
             b["id"] = i

@@ -20,9 +20,12 @@ Usage
     python change_white_booths.py input.jpg output.jpg
 """
 
+import logging
 import sys
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 # ====================== CONFIG: edit these ===============================
@@ -72,32 +75,39 @@ VAL_MIN = 200
 
 
 def _rgb_to_bgr(rgb):
+    logger.debug("_rgb_to_bgr() called rgb=%s", rgb)
     r, g, b = rgb
     return np.array((b, g, r), dtype=np.uint8)
 
 
 def recolor_green(img, out, color_bgr):
+    logger.debug("recolor_green() called color_bgr=%s", color_bgr)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(int)
     Hh, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
     mask = ((Hh >= GREEN_HUE_LO) & (Hh <= GREEN_HUE_HI) &
             (S >= GREEN_SAT_MIN) & (V >= GREEN_VAL_MIN))
     out[mask] = color_bgr
+    logger.debug("recolor_green: %d px matched green mask", int(mask.sum()))
     print(f"  green:  {int(mask.sum())} px")
     return int(mask.sum())
 
 
 def recolor_yellow(img, out, color_bgr):
+    logger.debug("recolor_yellow() called color_bgr=%s", color_bgr)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(int)
     Hh, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
     mask = ((Hh >= YELLOW_HUE_LO) & (Hh < YELLOW_HUE_HI) &
             (S >= YELLOW_SAT_MIN) & (V >= YELLOW_VAL_MIN))
     out[mask] = color_bgr
+    logger.debug("recolor_yellow: %d px matched yellow mask", int(mask.sum()))
     print(f"  yellow: {int(mask.sum())} px")
     return int(mask.sum())
 
 
 def _ring_non_white_frac(white_mask, x, y, w, h, ring_w=2):
     """Fraction of the 1-2px ring outside the bbox that is NOT white."""
+    logger.debug("_ring_non_white_frac() called x=%d y=%d w=%d h=%d ring_w=%d",
+                 x, y, w, h, ring_w)
     H, W = white_mask.shape
     x0, y0 = max(0, x - ring_w), max(0, y - ring_w)
     x1, y1 = min(W, x + w + ring_w), min(H, y + h + ring_w)
@@ -113,11 +123,13 @@ def _ring_non_white_frac(white_mask, x, y, w, h, ring_w=2):
 
 
 def recolor_white(img, out, color_bgr):
+    logger.debug("recolor_white() called color_bgr=%s", color_bgr)
     H, W = img.shape[:2]
     img_area = H * W
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     white = ((hsv[:, :, 1] < SAT_MAX) & (hsv[:, :, 2] > VAL_MIN)).astype(np.uint8) * 255
     n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=4)
+    logger.debug("recolor_white: %d white connected components", n_lbl - 1)
 
     # sanity check: is there at least one large clean white booth?
     biggest_clean = 0
@@ -128,7 +140,10 @@ def recolor_white(img, out, color_bgr):
         if area / (w * h) < 0.85:            continue
         if max(w, h) / max(1, min(w, h)) > 6: continue
         biggest_clean = max(biggest_clean, area)
+    logger.debug("recolor_white: biggest_clean=%d (threshold=%.1f)",
+                 int(biggest_clean), img_area * 0.0010)
     if biggest_clean < img_area * 0.0010:
+        logger.debug("recolor_white: no clean white booth found, leaving unchanged")
         print("  white: none detected (image left unchanged for this category)")
         return 0
 
@@ -145,31 +160,39 @@ def recolor_white(img, out, color_bgr):
         if _ring_non_white_frac(white, x, y, w, h, 2) < 0.50: continue
         out[labels == i] = color_bgr
         count += 1
+    logger.debug("recolor_white: recolored %d white booths", count)
     print(f"  white: recolored {count} booths")
     return count
 
 
 def recolor(in_path: str, out_path: str) -> None:
     """Recolor green, yellow, and white booths in a floor-plan image and save."""
+    logger.debug("recolor() called in_path=%s out_path=%s", in_path, out_path)
     img = cv2.imread(in_path)
     if img is None:
+        logger.debug("recolor: failed to read image %s", in_path)
         raise FileNotFoundError(in_path)
     out = img.copy()
     print(in_path.split("/")[-1])
     if DO_GREEN:
+        logger.debug("recolor: recoloring green")
         recolor_green(img, out, _rgb_to_bgr(TARGET_GREEN_RGB))
     if DO_YELLOW:
+        logger.debug("recolor: recoloring yellow")
         recolor_yellow(img, out, _rgb_to_bgr(TARGET_YELLOW_RGB))
     if DO_WHITE:
+        logger.debug("recolor: recoloring white")
         recolor_white(img, out, _rgb_to_bgr(TARGET_WHITE_RGB))
 
     if PRESERVE_TEXT:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         ink = gray < TEXT_DARK_MAX
         out[ink] = img[ink]
+        logger.debug("recolor: preserved %d ink px (text/borders/arrows)", int(ink.sum()))
         print(f"  preserved {int(ink.sum())} ink px (text/borders/arrows)")
 
     cv2.imwrite(out_path, out)
+    logger.info("recolor: wrote output image -> %s", out_path)
     print(f"  -> {out_path}")
 
 

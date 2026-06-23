@@ -20,6 +20,7 @@ booth_pipeline_docker/pdf_hybrid_pipeline.py.
 from __future__ import annotations
 
 import gc
+import logging
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -28,11 +29,14 @@ import cv2
 from _detectors import (EnsembleDetector, ColorDetector, BorderedCellDetector,
                         non_max_suppression)
 
+logger = logging.getLogger(__name__)
+
 _SEAM_EDGE = 4  # px: a box within this of an inner tile margin is "clipped"
 
 
 def _tile_origins(extent: int, tile: int, step: int) -> List[int]:
     """Tile start offsets so the last tile always reaches `extent`."""
+    logger.debug("_tile_origins() called extent=%s tile=%s step=%s", extent, tile, step)
     if extent <= tile:
         return [0]
     xs, x = [], 0
@@ -90,6 +94,8 @@ def _drop_contained(booths: List[Dict], ios_thresh: float = 0.6) -> List[Dict]:
     stray sub-cell inside a real booth survives NMS. Intersection-over-smaller
     catches exactly that containment while leaving abutting neighbours (IoS ~ 0)
     alone."""
+    logger.debug("_drop_contained() called n_booths=%s ios_thresh=%s",
+                 len(booths), ios_thresh)
     def area(b: Dict) -> float:
         x, y, w, h = b["bbox"]
         return float(w) * float(h)
@@ -108,6 +114,7 @@ def _drop_contained(booths: List[Dict], ios_thresh: float = 0.6) -> List[Dict]:
         if any(ios(b, o) >= ios_thresh and area(o) > area(b) for o in out):
             continue
         out.append(b)
+    logger.debug("_drop_contained: %s -> %s after containment dedup", len(booths), len(out))
     return out
 
 
@@ -126,6 +133,8 @@ def detect_tiled(bgr,
     tiles. `work_dir` only holds a scratch tile PNG that is removed at the end.
     Returns booths in full-image pixel coordinates.
     """
+    logger.debug("detect_tiled() called tile=%s overlap=%s iou_threshold=%s ios_thresh=%s",
+                 tile, overlap, iou_threshold, ios_thresh)
     def _log(m: str):
         if log:
             log(m)
@@ -137,6 +146,8 @@ def detect_tiled(bgr,
     ys = _tile_origins(H, tile, step)
     tmp_tile = Path(work_dir) / "_tile.png"
     total = len(xs) * len(ys)
+    logger.info("detect_tiled: %sx%s = %s tiles (tile=%s overlap=%s step=%s) image=%sx%s",
+                len(xs), len(ys), total, tile, overlap, step, W, H)
     _log(f"[tile] {len(xs)}x{len(ys)} = {total} tiles "
          f"(tile={tile}, overlap={overlap}, step={step})")
 
@@ -150,6 +161,8 @@ def detect_tiled(bgr,
             booths = det.detect(str(tmp_tile))
             n_raw += len(booths)
             n_tiles += 1
+            logger.debug("detect_tiled: tile %s/%s at (%s,%s) %sx%s -> %s raw, pool=%s",
+                         n_tiles, total, gx0, gy0, cw, ch, len(booths), len(pool))
             for b in booths:
                 if _clipped_at_seam(b, cw, ch, gx0, gy0, W, H):
                     continue
@@ -159,6 +172,8 @@ def detect_tiled(bgr,
                 _log(f"[tile] {n_tiles}/{total} done, pool={len(pool)}")
     if tmp_tile.exists():
         tmp_tile.unlink()
+    logger.info("detect_tiled: %s raw across %s tiles, %s after seam-clip",
+                n_raw, n_tiles, len(pool))
     _log(f"[detect] {n_raw} raw across tiles, {len(pool)} after seam-clip")
 
     nms_in = []
@@ -170,8 +185,11 @@ def detect_tiled(bgr,
         if poly is not None:
             entry["poly"] = poly
         nms_in.append(entry)
+    logger.debug("detect_tiled: running global NMS on %s pooled boxes (iou=%s)",
+                 len(nms_in), iou_threshold)
     kept = [k["_ref"] for k in non_max_suppression(nms_in, iou_threshold=iou_threshold)]
     kept = _drop_contained(kept, ios_thresh)
+    logger.info("detect_tiled: %s -> %s booths after global NMS + dedup", len(pool), len(kept))
     _log(f"[merge] {len(pool)} -> {len(kept)} booths after global NMS + dedup")
     return kept
 
@@ -214,6 +232,8 @@ def _distinct_label_cells(text_items: List[Dict], B: Dict, cell: int) -> int:
     title ('MAIN STAGE A50') into many overlapping rects, which would falsely
     flag a standalone region as a packed hall. Snapping to a booth-sized grid
     collapses one title to ~1 cell while a real booth grid keeps dozens."""
+    logger.debug("_distinct_label_cells() called n_text_items=%s cell=%s",
+                 len(text_items), cell)
     x, y, w, h = B["bbox"]
     cells = set()
     for ti in text_items:
@@ -248,6 +268,10 @@ def detect_big_regions(bgr,
     tiled pass already owns anything smaller. NMS collapses colour+bordered both
     firing on the same hall. The standalone-vs-container verdict is made later by
     merge_big_regions. `work_dir` holds a scratch PNG removed at the end."""
+    logger.debug("detect_big_regions() called max_edge=%s big_min_area_frac=%s "
+                 "big_max_area_frac=%s big_min_side_px=%s neutral_gray=%s",
+                 max_edge, big_min_area_frac, big_max_area_frac, big_min_side_px,
+                 neutral_gray)
     def _log(m: str):
         if log:
             log(m)
@@ -257,9 +281,11 @@ def detect_big_regions(bgr,
     long_edge = max(H, W)
     sf = (max_edge / long_edge) if (max_edge and long_edge > max_edge) else 1.0
     if sf < 1.0:
+        logger.debug("detect_big_regions: downscaling page %sx%s by sf=%s", W, H, sf)
         small_img = cv2.resize(bgr, (int(round(W * sf)), int(round(H * sf))),
                                interpolation=cv2.INTER_AREA)
     else:
+        logger.debug("detect_big_regions: no downscale needed (sf=%s)", sf)
         small_img = bgr.copy()
     tmp = Path(work_dir) / "_bigpass.png"
     cv2.imwrite(str(tmp), small_img)
@@ -281,8 +307,10 @@ def detect_big_regions(bgr,
                                                   max_area_frac=big_max_area_frac)),
     ]
     for name, make in builders:
+        logger.info("detect_big_regions: running %s detector on downscaled page", name)
         det = make()
         res = det.detect(str(tmp))
+        logger.debug("detect_big_regions: %s returned %s raw boxes", name, len(res))
         kept_here = 0
         for b in res:
             if sf < 1.0:
@@ -312,7 +340,10 @@ def detect_big_regions(bgr,
         if poly is not None:
             entry["poly"] = poly
         nms_in.append(entry)
+    logger.debug("detect_big_regions: running NMS on %s big raw boxes", len(raw))
     kept = [k["_ref"] for k in non_max_suppression(nms_in, iou_threshold=0.4)]
+    logger.info("detect_big_regions: %s raw -> %s big-region candidates "
+                "(sf=%.3f, min_side=%spx)", len(raw), len(kept), sf, big_min_side_px)
     _log(f"[big] {len(raw)} raw -> {len(kept)} big-region candidates "
          f"(sf={sf:.3f}, min_side={big_min_side_px}px)")
     return kept
@@ -339,6 +370,9 @@ def merge_big_regions(small: List[Dict], big: List[Dict], text_items: List[Dict]
     carry no text layer, so 0.20+ would leave a 0.18 hall KEPT as one giant box
     swallowing its grid; the distinct-label-cell test catches densely-labelled
     grids that coverage alone misses."""
+    logger.debug("merge_big_regions() called n_small=%s n_big=%s n_text_items=%s "
+                 "coverage_thresh=%s max_inner_labels=%s",
+                 len(small), len(big), len(text_items), coverage_thresh, max_inner_labels)
     def _log(m: str):
         if log:
             log(m)
@@ -365,6 +399,9 @@ def merge_big_regions(small: List[Dict], big: List[Dict], text_items: List[Dict]
         B["_coverage"] = round(coverage, 3)
         B["_n_inner"] = len(overlapping_s)
         B["_n_inner_labels"] = n_labels
+        logger.debug("merge_big_regions: candidate coverage=%.3f n_inner=%s "
+                     "n_labels=%s is_container=%s", coverage, len(overlapping_s),
+                     n_labels, is_container)
         if is_container:
             B["region_role"] = "container_dropped"
             continue
@@ -378,6 +415,9 @@ def merge_big_regions(small: List[Dict], big: List[Dict], text_items: List[Dict]
         keep_big.append(B)
         kept_big += 1
     out = [s for s in small if id(s) not in drop_inner] + keep_big
+    logger.info("merge_big_regions: %s/%s big candidates kept standalone "
+                "(%s dropped as containers); %s inner crops absorbed; %s total out",
+                kept_big, len(big), len(big) - kept_big, len(drop_inner), len(out))
     _log(f"[big] {kept_big}/{len(big)} big candidates kept as standalone booths "
          f"({len(big) - kept_big} dropped as hall containers); "
          f"{len(drop_inner)} inner crops absorbed")

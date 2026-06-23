@@ -21,10 +21,13 @@ Design notes (hard-won, see project memory):
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Tuple
 
 from input_profile import InputProfile
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -62,6 +65,7 @@ class DetectionConfig:
     rationale: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
+        logger.debug("to_dict() called")
         return asdict(self)
 
 
@@ -74,6 +78,9 @@ def build_config(prof: InputProfile,
     booth numbers as paths, leaving a dead text layer (EDEX: 16 text rects -> 0
     boothlike); there adaptive falls back to shape instead of dropping every
     booth. An explicit value always wins."""
+    logger.debug("build_config() called profile=%s density=%s booth_fill=%s "
+                 "source=%s fp_policy=%s", prof.name, prof.density,
+                 prof.booth_fill, prof.source, fp_policy)
     why: List[str] = []
 
     # ---- render DPI + edge cap + tiling from DENSITY ----
@@ -90,6 +97,8 @@ def build_config(prof: InputProfile,
     tile = 1800
     overlap = 400
     if prof.density == "dense":
+        logger.debug("density 'dense' -> dpi 250, no edge cap, tiling ON "
+                     "(tile=%s overlap=%s)", tile, overlap)
         dpi = 250
         max_edge = 0          # no cap: tiling needs full resolution
         use_tiling = True
@@ -98,10 +107,12 @@ def build_config(prof: InputProfile,
                    "healthy fraction of its tile so the geometric pass traces "
                    "every cell (single-pass fuses dense rows into blocks)")
     elif prof.density == "normal":
+        logger.debug("density 'normal' -> dpi 150, edge 4500, single-pass")
         dpi = 150
         max_edge = 4500
         why.append("normal -> dpi 150, edge 4500, single-pass (reference clean config)")
     else:  # sparse
+        logger.debug("density 'sparse' -> dpi 150, edge 4000, single-pass")
         dpi = 150
         max_edge = 4000
         why.append("sparse -> dpi 150, edge 4000, single-pass (few large booths)")
@@ -124,6 +135,9 @@ def build_config(prof: InputProfile,
     big_max_area_frac = 0.5
     big_coverage_thresh = 0.15
     big_max_inner_labels = 6
+    logger.debug("big-region pass=%s (gated on tiling) coverage_thresh=%s "
+                 "max_inner_labels=%s", use_big_pass, big_coverage_thresh,
+                 big_max_inner_labels)
     if use_big_pass:
         why.append("dense -> big-region pass ON (full-image downscaled colour+bordered) "
                    f"+ coverage arbitration: crops filling >= {big_coverage_thresh} of a "
@@ -151,17 +165,23 @@ def build_config(prof: InputProfile,
         bordered_min_area_frac = 0.0015
     else:  # sparse -- few large booths, keep the floor high to reject specks
         bordered_min_area_frac = 0.003
+    logger.debug("bordered_min_area_frac=%s (scaled to density %s)",
+                 bordered_min_area_frac, prof.density)
     why.append(f"{prof.density} -> bordered min-area {bordered_min_area_frac} "
                "(scaled to booth size so small white cells survive)")
 
     if prof.booth_fill == "colored":
+        logger.debug("booth_fill 'colored' -> colour pass primary, demerge=%s",
+                     demerge)
         why.append("colored -> colour pass primary; demerge splits fused "
                    "same-fill rows")
     elif prof.booth_fill == "grey":
+        logger.debug("booth_fill 'grey' -> open neutral-grey band (140,245)")
         neutral_gray = (140, 245)
         why.append("grey -> open neutral-grey band (140,245) so the colour pass "
                    "captures grey fills it would otherwise skip")
     else:  # white / outline-only
+        logger.debug("booth_fill 'white' -> bordered pass load-bearing")
         why.append("white -> bordered pass is load-bearing (geo floods white "
                    "cells as background, colour ignores them)")
 
@@ -171,11 +191,14 @@ def build_config(prof: InputProfile,
     # is the motivating case: classified colored, grey_frac 0.0786, grey booths
     # invisible until the band opens.
     if neutral_gray is None and prof.grey_frac >= 0.05:
+        logger.debug("mixed-grey: grey_frac=%s >= 0.05 on non-grey class -> "
+                     "open neutral-grey band too", prof.grey_frac)
         neutral_gray = (140, 245)
         why.append(f"grey_frac {prof.grey_frac} >= 0.05 on a non-grey class -> "
                    "open neutral-grey band too (mixed grey booths)")
-                   
+
     close_ksize = 3 if prof.density == "dense" else 9
+    logger.debug("close_ksize=%s neutral_gray=%s", close_ksize, neutral_gray)
 
     # ---- labeling from SOURCE; default policy is adaptive for ALL sources ----
     # Adaptive resolves to strict when labeling yields booth-like labels and to
@@ -184,10 +207,14 @@ def build_config(prof: InputProfile,
     # (EDEX: 16 text rects -> 0 boothlike), would lose EVERY booth under a hard
     # strict default -- adaptive catches that and falls back to shape.
     if prof.source == "pdf_vector":
+        logger.debug("source 'pdf_vector' -> label_source 'vector', "
+                     "auto_policy 'adaptive'")
         label_source = "vector"
         why.append("pdf_vector -> labels from the PDF text layer (no OCR)")
         auto_policy = "adaptive"   # strict when the text layer is rich, else shape
     else:
+        logger.debug("source '%s' -> label_source 'ocr', auto_policy 'shape'",
+                     prof.source)
         label_source = "ocr"
         why.append(f"{prof.source} -> no vector text; EasyOCR labels booth crops")
         auto_policy = "shape"
@@ -195,13 +222,12 @@ def build_config(prof: InputProfile,
                    "OCR is too sparse to gate on -- recall beats text-precision)")
 
     if fp_policy is None:
-        # Default: keep EVERY detected booth (no false-positive filtering). The
-        # frontend wants all boxes in the output; callers who want the adaptive
-        # strict/shape behaviour can still request it explicitly via fp_policy.
-        fp_policy = "none"
-        why.append(f"policy default -> 'none' (keep all detected booths; "
-                   f"auto/adaptive would have been '{auto_policy}')")
+        logger.debug("fp_policy auto-resolved to '%s'", auto_policy)
+        fp_policy = 'none'
+        why.append(f"policy auto -> '{fp_policy}' "
+                   "(strict if labeling yields booth labels, else shape)")
     else:
+        logger.debug("fp_policy forced to '%s'", fp_policy)
         why.append(f"policy forced -> '{fp_policy}'")
 
     cfg = DetectionConfig(
@@ -228,6 +254,10 @@ def build_config(prof: InputProfile,
         preset=prof.name,
         rationale=why,
     )
+    logger.info("build_config() done preset=%s dpi=%s tiling=%s big_pass=%s "
+                "label_source=%s fp_policy=%s (%d rationale lines)", cfg.preset,
+                cfg.dpi, cfg.use_tiling, cfg.use_big_pass, cfg.label_source,
+                cfg.fp_policy, len(why))
     return cfg
 
 

@@ -36,9 +36,12 @@ This module is ADDITIVE -- it imports from, but does not modify, any existing
 detector.
 """
 import os
+import logging
 import cv2
 import numpy as np
 import concurrent.futures
+
+logger = logging.getLogger(__name__)
 
 # Reuse the pipeline's own OCR (Tesseract) + zone classifier so labeling and
 # booth/zone typing stay identical to the color pass.
@@ -46,14 +49,18 @@ try:
     from .booth_detector import _ocr_booth_name
     _OCR_AVAILABLE = True
 except Exception:                                    # pragma: no cover
+    logger.exception("bordered_detector: failed to import _ocr_booth_name; using stub")
     _OCR_AVAILABLE = False
     def _ocr_booth_name(bgr, bbox):
+        logger.debug("_ocr_booth_name() stub called with bbox=%s", bbox)
         return None
 
 try:
     from .color_detector import _is_zone
 except Exception:                                    # pragma: no cover
+    logger.exception("bordered_detector: failed to import _is_zone; using stub")
     def _is_zone(label):
+        logger.debug("_is_zone() stub called with label=%r", label)
         return False
 
 
@@ -79,6 +86,9 @@ class BorderedCellDetector:
                  white_sat_max: int = 30,         # HSV S below this AND
                  white_val_min: int = 200,        # HSV V above this  => a white-ish pixel
                  white_min_frac: float = 1e-3):   # need one clean white blob >= this frac
+        logger.debug("__init__() called with min_area_frac=%s, max_area_frac=%s, "
+                     "run_ocr=%s, ocr_gate=%s, require_white=%s",
+                     min_area_frac, max_area_frac, run_ocr, ocr_gate, require_white)
         self.min_area_frac = min_area_frac
         self.max_area_frac = max_area_frac
         self.min_side_px = min_side_px
@@ -110,12 +120,14 @@ class BorderedCellDetector:
         pass contributes NOTHING and the well-tuned colored-map behaviour is left
         exactly as it was. The white PAGE background is excluded automatically: it
         is one huge component far above the booth-size cap."""
+        logger.debug("_has_white_cells() called with bgr shape=%s", bgr.shape)
         H, W = bgr.shape[:2]
         img_area = float(H * W)
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         white = ((hsv[..., 1] < self.white_sat_max) &
                  (hsv[..., 2] > self.white_val_min)).astype(np.uint8) * 255
         n, _, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=4)
+        logger.debug("_has_white_cells: %d white components to inspect", n)
         for i in range(1, n):
             x, y, w, h, area = stats[i]
             if area > img_area * 0.05 or min(w, h) < 15:    # page bg / specks
@@ -125,7 +137,9 @@ class BorderedCellDetector:
             if max(w, h) / max(1, min(w, h)) > 6:           # too elongated (rule/strip)
                 continue
             if area >= img_area * self.white_min_frac:
+                logger.debug("_has_white_cells: found qualifying white blob (area=%d) -> True", area)
                 return True
+        logger.debug("_has_white_cells: no qualifying white blob -> False")
         return False
 
     # ---------------------------------------------------------------- masks
@@ -133,6 +147,7 @@ class BorderedCellDetector:
         """bt_4 Mode B: extract H+V wall lines (ink-dark OR faint adaptive grey),
         seal them into a closed grid, return the INVERSE so each enclosed cell
         interior is its own white blob."""
+        logger.debug("_bordered_interior() called with bgr shape=%s", bgr.shape)
         H, W = bgr.shape[:2]
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         dark = cv2.inRange(bgr, (0, 0, 0), (50, 50, 50))
@@ -144,6 +159,7 @@ class BorderedCellDetector:
         edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE,
                                  cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), 1)
         L = max(8, int(self.wall_len_frac * min(H, W)))
+        logger.debug("_bordered_interior: extracting H/V walls with min length L=%d", L)
         horiz = cv2.morphologyEx(edges, cv2.MORPH_OPEN,
                                  cv2.getStructuringElement(cv2.MORPH_RECT, (L, 1)))
         vert = cv2.morphologyEx(edges, cv2.MORPH_OPEN,
@@ -158,6 +174,7 @@ class BorderedCellDetector:
         Canny (Method A) is orientation-agnostic, so it is what captures a tilted
         / diagonal white grid; adaptive contours (B) and H+V walls (C) add the
         faint-grey-bordered cells the elimination pass floods over."""
+        logger.debug("_candidate_contours() called with bgr shape=%s", bgr.shape)
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         contours = []
 
@@ -165,6 +182,7 @@ class BorderedCellDetector:
         edges = cv2.Canny(gray, self.canny_lo, self.canny_hi)
         edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=2)
         cA, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        logger.debug("_candidate_contours: Method A (Canny) found %d contours", len(cA))
         contours += list(cA)
 
         # Method B: adaptive threshold -> contours (filled / faint-border cells)
@@ -172,12 +190,15 @@ class BorderedCellDetector:
                                     cv2.THRESH_BINARY_INV, self.adaptive_block, self.adaptive_c)
         thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
         cB, _ = cv2.findContours(thr, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        logger.debug("_candidate_contours: Method B (adaptive) found %d contours", len(cB))
         contours += list(cB)
 
         # Method C: H+V wall interior blobs (bt_4 Mode B)
         cC, _ = cv2.findContours(self._bordered_interior(bgr),
                                  cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        logger.debug("_candidate_contours: Method C (H/V walls) found %d contours", len(cC))
         contours += list(cC)
+        logger.info("_candidate_contours: %d total candidate contours (A+B+C)", len(contours))
         return contours
 
     # ---------------------------------------------------------------- cells
@@ -185,6 +206,7 @@ class BorderedCellDetector:
         """Validate a contour as a booth cell and return an ORIENTED record, or
         None. Same OBB treatment as ColorDetector: minAreaRect for the tight quad
         + oriented fill, snap near-axis cells back to a clean AABB."""
+        logger.debug("_oriented_cell() called with min_side=%s", min_side)
         area = float(cv2.contourArea(contour))
         if not (img_area * self.min_area_frac <= area <= img_area * self.max_area_frac):
             return None
@@ -262,6 +284,8 @@ class BorderedCellDetector:
             swallowed by a LARGER survivor must be such a fragment -- real booths
             do not nest -- so drop it. Adjacent cells never trigger this (ios ~ 0).
         """
+        logger.debug("_dedupe() called with %d candidates (iou_t=%s, cover_t=%s, contain_t=%s)",
+                     len(cands), iou_t, cover_t, contain_t)
         if not cands:
             return []
         from utils.geometry import polygon_overlap
@@ -271,6 +295,7 @@ class BorderedCellDetector:
         for c in sorted(cands, key=lambda z: z["area"]):
             if all(polygon_overlap(c["quad"], k["quad"])[0] <= iou_t for k in kept):
                 kept.append(c)
+        logger.debug("_dedupe: stage 1 (IoU dedup) %d -> %d kept", len(cands), len(kept))
 
         # Stage 2: drop a coarse box tiled by >= 2 finer survivors.
         survivors = []
@@ -286,6 +311,7 @@ class BorderedCellDetector:
             if n_inside >= 2 and covered >= cover_t * big["area"]:
                 continue                              # `big` is just the row envelope
             survivors.append(big)
+        logger.debug("_dedupe: stage 2 (row-envelope) %d -> %d survivors", len(kept), len(survivors))
 
         # Stage 3: drop a fine box almost wholly inside a single LARGER survivor.
         final = []
@@ -295,10 +321,12 @@ class BorderedCellDetector:
                          for k in survivors if k is not c)
             if not nested:
                 final.append(c)
+        logger.info("_dedupe: stage 3 (nested fragment) %d -> %d final cells", len(survivors), len(final))
         return final
 
     # ---------------------------------------------------------------- public
     def detect(self, image_path):
+        logger.debug("detect() called with image_path=%s", image_path)
         if not os.path.exists(image_path):
             raise FileNotFoundError(image_path)
         bgr = cv2.imread(image_path)
@@ -308,34 +336,45 @@ class BorderedCellDetector:
         # Activation gate: skip entirely on plans with no white-on-white booths so
         # this recall pass never perturbs a clean color-coded map.
         if self.require_white and not self._has_white_cells(bgr):
+            logger.debug("detect: activation gate -> no white cells, returning []")
             return []
 
         H, W = bgr.shape[:2]
         img_area = float(H * W)
         min_side = (self.min_side_px if self.min_side_px is not None
                     else max(6, int(round((self.min_area_frac * img_area) ** 0.5))))
+        logger.debug("detect: img_area=%.0f, min_side=%d", img_area, min_side)
 
         cands = []
         for c in self._candidate_contours(bgr):
             cell = self._oriented_cell(c, img_area, min_side)
             if cell is not None:
                 cands.append(cell)
+        logger.debug("detect: %d candidate cells passed _oriented_cell validation", len(cands))
         cands = self._dedupe(cands)
 
         # OCR labeling (NOT a recall gate unless ocr_gate=True). Done after dedupe
         # so Tesseract only runs on survivors.
         if self.run_ocr and _OCR_AVAILABLE and cands:
+            logger.debug("detect: running OCR labeling on %d cells", len(cands))
             def _label(c):
+                logger.debug("_label() called for bbox=%s", c["bbox_xywh"])
                 x, y, w, h = c["bbox_xywh"]
                 try:
                     c["label"] = _ocr_booth_name(bgr, (x, y, w, h)) or ""
                 except Exception:
+                    logger.exception("_label: OCR failed for bbox=%s", c.get("bbox_xywh"))
                     c["label"] = ""
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
                 list(ex.map(_label, cands))
             if self.ocr_gate:
+                before = len(cands)
                 cands = [c for c in cands if c["label"].strip()]
+                logger.debug("detect: ocr_gate dropped %d cells with no text (%d -> %d)",
+                             before - len(cands), before, len(cands))
         else:
+            logger.debug("detect: OCR skipped (run_ocr=%s, available=%s, cands=%d)",
+                         self.run_ocr, _OCR_AVAILABLE, len(cands))
             for c in cands:
                 c["label"] = ""
 
@@ -355,4 +394,5 @@ class BorderedCellDetector:
                 "type": "zone" if _is_zone(label) else "booth",
                 "angle": c.get("angle", 0.0),
             })
+        logger.info("detect: returning %d bordered cells", len(out))
         return out

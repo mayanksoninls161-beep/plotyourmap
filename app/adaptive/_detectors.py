@@ -10,9 +10,12 @@ sub-detectors from it, so the adaptive layer always runs the same detectors.
 Only the ADAPTIVE layer (profiling, preset selection, labeling/tagging/policy,
 orchestration) lives in this folder.
 """
+import logging
 import os
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Roots that contain a `detectors/` package and `utils/geometry.py`. First match
 # wins. Every candidate is INSIDE the deploy folder / image -- nothing external:
@@ -28,12 +31,14 @@ _CANDIDATES = [
 
 
 def _resolve_detector_root() -> str:
+    logger.debug("_resolve_detector_root() called candidates=%s", _CANDIDATES)
     for c in _CANDIDATES:
         if not c:
             continue
         p = Path(c)
         if (p / "detectors" / "ensemble_detector.py").is_file() and \
            (p / "utils" / "geometry.py").is_file():
+            logger.info("_resolve_detector_root: resolved DETECTOR_ROOT=%s", p)
             return str(p)
     raise ImportError(
         "Could not find a detector source with detectors/ensemble_detector.py "
