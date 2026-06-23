@@ -25,6 +25,7 @@ real plans instead of guessed in the abstract.
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -32,6 +33,8 @@ from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Long edge (px) of the small image used only for characterization. Big enough
 # that the geometric pass can see cells, small enough to stay ~1-3s.
@@ -68,13 +71,16 @@ class InputProfile:
 
     @property
     def is_pdf(self) -> bool:
+        logger.debug("is_pdf called source=%s", self.source)
         return self.source.startswith("pdf")
 
     @property
     def name(self) -> str:
+        logger.debug("name called")
         return f"{self.source}/{self.booth_fill}/{self.density}"
 
     def to_dict(self) -> Dict:
+        logger.debug("to_dict() called")
         d = asdict(self)
         d["name"] = self.name        # @property -- asdict() omits it
         d["is_pdf"] = self.is_pdf
@@ -88,8 +94,10 @@ def _load_profile_image(path: str) -> Tuple[np.ndarray, str, int, Optional[Tuple
     For PDFs we render page 0 at a scale capped to PROFILE_EDGE and count text
     rects to tell vector from scanned. For raster files we just read + downscale.
     """
+    logger.debug("_load_profile_image() called path=%s", path)
     ext = Path(path).suffix.lower()
     if ext == ".pdf":
+        logger.debug("_load_profile_image: PDF branch, rendering page 0")
         import pypdfium2 as pdfium
         pdf = pdfium.PdfDocument(path)
         n_pages = len(pdf)
@@ -97,6 +105,8 @@ def _load_profile_image(path: str) -> Tuple[np.ndarray, str, int, Optional[Tuple
         w_pt, h_pt = page.get_size()
         long_pt = max(w_pt, h_pt)
         scale = PROFILE_EDGE / long_pt if long_pt > 0 else 1.0
+        logger.debug("_load_profile_image: n_pages=%s page_pt=(%s,%s) scale=%s",
+                     n_pages, w_pt, h_pt, scale)
         bitmap = page.render(scale=scale)
         rgb = np.asarray(bitmap.to_pil().convert("RGB"))
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -111,9 +121,12 @@ def _load_profile_image(path: str) -> Tuple[np.ndarray, str, int, Optional[Tuple
         page.close()
         pdf.close()
         source = "pdf_vector" if n_rects >= 3 else "pdf_raster"
+        logger.debug("_load_profile_image: n_text_rects=%s -> source=%s",
+                     n_rects, source)
         return bgr, source, n_rects, (w_pt, h_pt), n_pages
 
     # raster image
+    logger.debug("_load_profile_image: raster branch, reading image")
     bgr = cv2.imread(path)
     if bgr is None:
         raise FileNotFoundError(f"Could not read image: {path}")
@@ -121,7 +134,11 @@ def _load_profile_image(path: str) -> Tuple[np.ndarray, str, int, Optional[Tuple
     long_px = max(w, h)
     if long_px > PROFILE_EDGE:
         s = PROFILE_EDGE / float(long_px)
+        logger.debug("_load_profile_image: downscaling long edge %s -> %s",
+                     long_px, PROFILE_EDGE)
         bgr = cv2.resize(bgr, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+    logger.debug("_load_profile_image: raster done px=(%s,%s)", bgr.shape[1],
+                 bgr.shape[0])
     return bgr, "image", 0, None, 1
 
 
@@ -130,6 +147,8 @@ def _colour_fractions(bgr: np.ndarray) -> Tuple[float, float, float]:
 
     colored = saturated and not too dark/bright; grey = desaturated mid-tone;
     white = bright + desaturated (page background, NOT a booth fill signal)."""
+    logger.debug("_colour_fractions() called px=(%s,%s)", bgr.shape[1],
+                 bgr.shape[0])
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     s = hsv[:, :, 1].astype(np.int32)
     v = hsv[:, :, 2].astype(np.int32)
@@ -137,12 +156,16 @@ def _colour_fractions(bgr: np.ndarray) -> Tuple[float, float, float]:
     colored = np.count_nonzero((s > 45) & (v > 50) & (v < 250))
     grey = np.count_nonzero((s <= 30) & (v >= 120) & (v <= 210))
     white = np.count_nonzero((s <= 30) & (v > 210))
+    logger.debug("_colour_fractions: colored=%.4f grey=%.4f white=%.4f",
+                 colored / total, grey / total, white / total)
     return colored / total, grey / total, white / total
 
 
 def _geometric_density(bgr_small: np.ndarray) -> Tuple[int, float]:
     """Run the geometric pass (fastest, OCR off) on the small image and return
     (n_cells, median_area_frac). Scale-invariant size signal for density."""
+    logger.debug("_geometric_density() called px=(%s,%s)", bgr_small.shape[1],
+                 bgr_small.shape[0])
     import tempfile, os
     from _detectors import OpenCVDetector
     fd, tmp = tempfile.mkstemp(suffix=".png")
@@ -151,11 +174,14 @@ def _geometric_density(bgr_small: np.ndarray) -> Tuple[int, float]:
         cv2.imwrite(tmp, bgr_small)
         boxes = OpenCVDetector(run_ocr=False).detect(tmp)
     except Exception:
+        logger.exception("_geometric_density: geometric detection failed")
         return 0, 0.0
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+    logger.debug("_geometric_density: geometric pass found %d boxes", len(boxes))
     if not boxes:
+        logger.debug("_geometric_density: no boxes -> (0, 0.0)")
         return 0, 0.0
     img_area = float(bgr_small.shape[0] * bgr_small.shape[1]) or 1.0
     hsv = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2HSV)
@@ -176,40 +202,69 @@ def _geometric_density(bgr_small: np.ndarray) -> Tuple[int, float]:
             continue
             
         areas.append((w * h) / img_area)
-        
+
+    logger.debug("_geometric_density: %d/%d boxes kept after white-cell filter",
+                 len(areas), len(boxes))
     if not areas:
         # Fallback if somehow EVERYTHING was white
+        logger.debug("_geometric_density: all boxes were white -> fallback to "
+                     "all %d boxes", len(boxes))
         areas = [(b["bbox"][2] * b["bbox"][3]) / img_area for b in boxes]
-        
+
+    logger.debug("_geometric_density: n_geo=%d median_area_frac=%s", len(boxes),
+                 float(np.median(areas)))
     return len(boxes), float(np.median(areas))
 
 
 def _classify_fill(colored_frac: float, grey_frac: float) -> str:
+    logger.debug("_classify_fill() called colored_frac=%s grey_frac=%s",
+                 colored_frac, grey_frac)
     if colored_frac >= COLORED_FRAC_MIN:
+        logger.debug("_classify_fill: colored_frac >= %s -> 'colored'",
+                     COLORED_FRAC_MIN)
         return "colored"
     if grey_frac >= GREY_FRAC_MIN:
+        logger.debug("_classify_fill: grey_frac >= %s -> 'grey'", GREY_FRAC_MIN)
         return "grey"
+    logger.debug("_classify_fill: -> 'white'")
     return "white"
 
 
 def _classify_density(n_geo: int, median_area_frac: float) -> str:
+    logger.debug("_classify_density() called n_geo=%s median_area_frac=%s",
+                 n_geo, median_area_frac)
     if n_geo < 15:
+        logger.debug("_classify_density: n_geo < 15 -> 'sparse'")
         return "sparse"
     if median_area_frac <= DENSE_MED_AREA_MAX and n_geo >= DENSE_MIN_COUNT:
+        logger.debug("_classify_density: median_area<=%s and n_geo>=%s -> "
+                     "'dense'", DENSE_MED_AREA_MAX, DENSE_MIN_COUNT)
         return "dense"
     if median_area_frac <= NORMAL_MED_AREA_MAX:
+        logger.debug("_classify_density: median_area<=%s -> 'normal'",
+                     NORMAL_MED_AREA_MAX)
         return "normal"
+    logger.debug("_classify_density: -> 'sparse'")
     return "sparse"
 
 
 def characterize(path: str) -> InputProfile:
+    logger.info("characterize() called path=%s", path)
     t0 = time.perf_counter()
     bgr, source, n_rects, page_pt, n_pages = _load_profile_image(path)
+    logger.debug("characterize: loaded image source=%s n_text_rects=%s "
+                 "n_pages=%s px=(%s,%s)", source, n_rects, n_pages,
+                 bgr.shape[1], bgr.shape[0])
     colored_frac, grey_frac, white_frac = _colour_fractions(bgr)
     n_geo, median_area_frac = _geometric_density(bgr)
+    logger.debug("characterize: measured colored=%.4f grey=%.4f white=%.4f "
+                 "n_geo=%s median_area_frac=%s", colored_frac, grey_frac,
+                 white_frac, n_geo, median_area_frac)
 
     booth_fill = _classify_fill(colored_frac, grey_frac)
     density = _classify_density(n_geo, median_area_frac)
+    logger.debug("characterize: verdict source=%s booth_fill=%s density=%s",
+                 source, booth_fill, density)
 
     prof = InputProfile(
         path=path,
@@ -228,7 +283,11 @@ def characterize(path: str) -> InputProfile:
         elapsed_s=round(time.perf_counter() - t0, 2),
     )
     if n_pages > 1:
+        logger.debug("characterize: multi-page (%s); profiling page 0 only",
+                     n_pages)
         prof.notes.append(f"multi-page ({n_pages}); profiling page 0 only")
+    logger.info("characterize() done -> %s (elapsed %ss)", prof.name,
+                prof.elapsed_s)
     return prof
 
 

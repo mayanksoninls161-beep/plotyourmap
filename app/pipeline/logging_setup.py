@@ -18,6 +18,8 @@ import logging
 import os
 from logging.handlers import RotatingFileHandler
 
+logger = logging.getLogger(__name__)
+
 _CONFIGURED = False
 
 LOG_DIR = os.getenv("LOG_DIR", "/data/logs")
@@ -36,6 +38,7 @@ _NOISY = ("urllib3", "httpx", "httpcore", "PIL", "matplotlib", "asyncio")
 
 def _resolve_log_dir() -> str:
     """First writable dir among: $LOG_DIR, ./logs, $TMPDIR/booth_logs."""
+    logger.debug("_resolve_log_dir() called")
     import tempfile
     candidates = [LOG_DIR, os.path.join(os.getcwd(), "logs"),
                   os.path.join(tempfile.gettempdir(), "booth_logs")]
@@ -46,17 +49,22 @@ def _resolve_log_dir() -> str:
             with open(testfile, "w") as fh:
                 fh.write("")
             os.remove(testfile)
+            logger.debug("_resolve_log_dir: chose writable dir %s", d)
             return d
         except Exception:
+            logger.exception("_resolve_log_dir: candidate dir %s not writable", d)
             continue
+    logger.debug("_resolve_log_dir: no writable dir found, falling back to console-only")
     return ""  # no writable dir -> console-only
 
 
 def setup_logging(force: bool = False) -> str:
     """Configure root logging once. Returns the log file path (or '' if file
     logging was not possible, in which case logging is console-only)."""
+    logger.debug("setup_logging() called with force=%s", force)
     global _CONFIGURED
     if _CONFIGURED and not force:
+        logger.debug("setup_logging: already configured, returning cached log path")
         return getattr(setup_logging, "_log_path", "")
 
     fmt = logging.Formatter(_FMT)
@@ -69,6 +77,7 @@ def setup_logging(force: bool = False) -> str:
 
     log_dir = _resolve_log_dir()
     log_path = os.path.join(log_dir, LOG_FILE) if log_dir else ""
+    logger.debug("setup_logging: resolved log_dir=%r log_path=%r", log_dir, log_path)
     if log_path:
         try:
             file_handler = RotatingFileHandler(
@@ -78,6 +87,7 @@ def setup_logging(force: bool = False) -> str:
             file_handler.setFormatter(fmt)
             root.addHandler(file_handler)
         except Exception:
+            logger.exception("setup_logging: failed to install file handler at %s", log_path)
             log_path = ""
 
     console = logging.StreamHandler()

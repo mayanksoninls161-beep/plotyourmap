@@ -1,8 +1,12 @@
+import logging
 import numpy as np
 import cv2
 
+logger = logging.getLogger(__name__)
+
 
 def _poly_area(poly):
+    logger.debug("_poly_area() called")
     p = np.asarray(poly, dtype=np.float32).reshape(-1, 2)
     if len(p) < 3:
         return 0.0
@@ -16,13 +20,16 @@ def polygon_iou(poly1, poly2):
     axis-aligned envelope, so comparing the quads here is what stops fusion/NMS
     from wrongly merging tilted neighbours. Returns 0.0 on degenerate input.
     """
+    logger.debug("polygon_iou() called")
     a = np.asarray(poly1, dtype=np.float32).reshape(-1, 2)
     b = np.asarray(poly2, dtype=np.float32).reshape(-1, 2)
     if len(a) < 3 or len(b) < 3:
+        logger.debug("polygon_iou: degenerate input len(a)=%d len(b)=%d", len(a), len(b))
         return 0.0
     try:
         inter, _ = cv2.intersectConvexConvex(a, b)
     except Exception:
+        logger.exception("polygon_iou: cv2.intersectConvexConvex failed")
         return 0.0
     if inter <= 0:
         return 0.0
@@ -39,13 +46,16 @@ def polygon_overlap(poly1, poly2):
     detected as a tiny cell sitting inside the real booth cell. IoU alone cannot
     suppress that (a 7x-smaller nested box has IoU ~0.15), so NMS needs ios too.
     """
+    logger.debug("polygon_overlap() called")
     a = np.asarray(poly1, dtype=np.float32).reshape(-1, 2)
     b = np.asarray(poly2, dtype=np.float32).reshape(-1, 2)
     if len(a) < 3 or len(b) < 3:
+        logger.debug("polygon_overlap: degenerate input len(a)=%d len(b)=%d", len(a), len(b))
         return 0.0, 0.0
     try:
         inter, _ = cv2.intersectConvexConvex(a, b)
     except Exception:
+        logger.exception("polygon_overlap: cv2.intersectConvexConvex failed")
         return 0.0, 0.0
     if inter <= 0:
         return 0.0, 0.0
@@ -60,6 +70,7 @@ def polygon_overlap(poly1, poly2):
 def _bbox_overlap(box1, box2):
     """(iou, ios) for two axis-aligned boxes [x1,y1,x2,y2]. ios as in
     `polygon_overlap`. Used as the fallback when a box carries no polygon."""
+    logger.debug("_bbox_overlap() called")
     iou = calculate_iou(box1, box2)
     x1 = max(box1[0], box2[0]); y1 = max(box1[1], box2[1])
     x2 = min(box1[2], box2[2]); y2 = min(box1[3], box2[3])
@@ -78,6 +89,7 @@ def calculate_iou(box1, box2):
     Calculate the Intersection over Union (IoU) of two bounding boxes.
     Boxes are in format [x1, y1, x2, y2].
     """
+    logger.debug("calculate_iou() called")
     x1_inter = max(box1[0], box2[0])
     y1_inter = max(box1[1], box2[1])
     x2_inter = min(box1[2], box2[2])
@@ -113,7 +125,10 @@ def non_max_suppression(boxes, iou_threshold=0.3, containment_threshold=0.7):
     Backward-compatible: callers passing only {"bbox","score"} (no "poly") and
     the previous single-arg signature still behave as before.
     """
+    logger.debug("non_max_suppression() called with %d boxes, iou_threshold=%s, containment_threshold=%s",
+                 len(boxes) if boxes else 0, iou_threshold, containment_threshold)
     if not boxes:
+        logger.debug("non_max_suppression: no boxes, returning empty list")
         return []
 
     def _area(b):
@@ -148,6 +163,9 @@ def non_max_suppression(boxes, iou_threshold=0.3, containment_threshold=0.7):
         if n_inside >= 2 and covered >= 0.75 * _area(big) and not is_false_split:
             print(f"Dropped by merged block: {_area(big)}"); continue # big is a true merged block, drop it!
         valid_boxes.append(big)
+
+    logger.debug("non_max_suppression: pre-processing kept %d of %d boxes after merged-block drop",
+                 len(valid_boxes), len(boxes))
 
     # Sort by score desc, then area desc (so the larger of a nested pair is kept)
     sorted_boxes = sorted(valid_boxes, key=lambda x: (x.get('score', 1.0), _area(x)),
@@ -188,4 +206,5 @@ def non_max_suppression(boxes, iou_threshold=0.3, containment_threshold=0.7):
         else:
             kept_boxes.append(current)
 
+    logger.debug("non_max_suppression: returning %d boxes after NMS", len(kept_boxes))
     return kept_boxes

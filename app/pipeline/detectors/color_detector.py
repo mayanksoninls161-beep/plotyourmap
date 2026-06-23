@@ -20,9 +20,12 @@ Output matches the rest of the pipeline: a list of dicts with
 This module is ADDITIVE -- it does not modify any existing detector.
 """
 import os
+import logging
 import cv2
 import numpy as np
 import concurrent.futures
+
+logger = logging.getLogger(__name__)
 
 # Reuse the pipeline's own OCR (Tesseract) so labeling stays consistent.
 try:
@@ -46,6 +49,7 @@ ZONE_KEYWORDS = {
 
 
 def _is_zone(label: str) -> bool:
+    logger.debug("_is_zone() called with label=%r", label)
     if not label:
         return False
     toks = [t.lower() for t in label.replace("/", " ").split()]
@@ -75,6 +79,9 @@ class ColorDetector:
                                                   # marks) inside a fill; 9 bridges thin dividers
                                                   # too, FUSING abutting same-color cells. Shrink
                                                   # (e.g. 3) on dense grids so cells stay split.
+        logger.debug("__init__() called with max_colors=%s, min_area_frac=%s, "
+                     "max_area_frac=%s, run_ocr=%s, ocr_gate=%s, close_ksize=%s",
+                     max_colors, min_area_frac, max_area_frac, run_ocr, ocr_gate, close_ksize)
         self.max_colors = max_colors
         self.min_color_frac = min_color_frac
         self.min_area_frac = min_area_frac
@@ -96,6 +103,7 @@ class ColorDetector:
         anti-aliased edges, thin colored rules, or text-adjacent pixels -- those
         impure samples were desaturating the centers and tanking recall.
         """
+        logger.debug("_discover_colors() called with bgr shape=%s", bgr.shape)
         H, W = bgr.shape[:2]
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         S, V = hsv[:, :, 1], hsv[:, :, 2]
@@ -103,22 +111,28 @@ class ColorDetector:
 
         colored = (S >= 20) & (V >= 60) & (gray >= 70) & (gray <= 252)
         if self.neutral_gray is not None:
+            logger.debug("_discover_colors: including neutral_gray band %s", self.neutral_gray)
             lo, hi = self.neutral_gray
             colored = colored | ((S < 32) & (gray >= lo) & (gray <= hi))
         near_white = (S < 18) & (V > 235)
         mask = (colored & (~near_white)).astype(np.uint8)
+        logger.debug("_discover_colors: colored mask has %d pixels", int(mask.sum()))
         if int(mask.sum()) < 50:
+            logger.debug("_discover_colors: too few colored pixels, returning no colors")
             return []
 
         # sample only solid interiors for the k-means (drops thin strokes/edges)
         interior = cv2.erode(mask, np.ones((5, 5), np.uint8), iterations=2)
         if int(interior.sum()) < 50:
+            logger.debug("_discover_colors: eroded interior too small, falling back to full mask")
             interior = mask
         pts = bgr[interior.astype(bool)].reshape(-1, 3).astype(np.float32)
         rng = np.random.RandomState(0)
         if len(pts) > 30000:
+            logger.debug("_discover_colors: subsampling %d points to 30000 for k-means", len(pts))
             pts = pts[rng.choice(len(pts), 30000, replace=False)]
         K = int(min(self.max_colors, max(2, len(pts) // 500)))
+        logger.debug("_discover_colors: running k-means with K=%d on %d points", K, len(pts))
         crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
         _, _, centers = cv2.kmeans(pts, K, None, crit, 3, cv2.KMEANS_PP_CENTERS)
 
@@ -129,6 +143,7 @@ class ColorDetector:
         for c in centers:
             within = np.linalg.norm(full - c.astype(np.int32), axis=1) < self.color_dist
             cand.append((c, float(within.sum()) / float(H * W)))
+        logger.debug("_discover_colors: %d candidate centers before merge", len(cand))
 
         # merge near-duplicate color centers, keep the better-covered one
         merged = []
@@ -136,11 +151,15 @@ class ColorDetector:
             if any(np.linalg.norm(c - mc) < 35 for mc, _ in merged):
                 continue
             merged.append((c, cov))
-        return [(c, cov) for c, cov in merged if cov >= self.min_color_frac]
+        result = [(c, cov) for c, cov in merged if cov >= self.min_color_frac]
+        logger.info("_discover_colors: %d merged centers -> %d dominant fill colors above min_color_frac",
+                    len(merged), len(result))
+        return result
 
     # ---------------------------------------------------------------- regions
     def _regions_for_color(self, bgr, dark_d, center):
         """Connected rectangular regions of one fill color."""
+        logger.debug("_regions_for_color() called with center=%s", tuple(int(v) for v in center))
         H, W = bgr.shape[:2]
         img_area = H * W
         # smallest allowed short side. A region thinner than a square of the
@@ -162,6 +181,7 @@ class ColorDetector:
         core = cv2.morphologyEx(m_closed, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
         n, labels, stats, _ = cv2.connectedComponentsWithStats(core, connectivity=4)
+        logger.debug("_regions_for_color: %d connected components (incl. background)", n)
         out = []
         for i in range(1, n):
             x, y, w, h, area = stats[i]
@@ -214,6 +234,7 @@ class ColorDetector:
                 "angle": round(float(a45), 1),
                 "color": tuple(int(v) for v in center[::-1]),    # store as RGB
             })
+        logger.debug("_regions_for_color: kept %d regions for this color", len(out))
         return out
 
     @staticmethod
@@ -223,15 +244,18 @@ class ColorDetector:
         Uses oriented-quad IoU so two tilted neighbours are not wrongly merged
         by their loose axis-aligned envelopes.
         """
+        logger.debug("_dedupe() called with %d candidates, iou_t=%s", len(cands), iou_t)
         from utils.geometry import polygon_iou
         kept = []
         for c in sorted(cands, key=lambda z: -z["area"]):
             if all(polygon_iou(c["quad"], k["quad"]) <= iou_t for k in kept):
                 kept.append(c)
+        logger.info("_dedupe: %d candidates -> %d after IoU dedup", len(cands), len(kept))
         return kept
 
     # ---------------------------------------------------------------- public
     def detect(self, image_path):
+        logger.debug("detect() called with image_path=%s", image_path)
         if not os.path.exists(image_path):
             raise FileNotFoundError(image_path)
         bgr = cv2.imread(image_path)
@@ -247,18 +271,23 @@ class ColorDetector:
         # booths on AutoTech Asia). Erosion inside _discover_colors already keeps
         # the learned color centers clean, so no pre-smoothing is needed.
         colors = self._discover_colors(bgr)
+        logger.debug("detect: segmenting regions for %d discovered colors", len(colors))
         cands = []
         for center, _cov in colors:
             cands += self._regions_for_color(bgr, dark_d, center)
+        logger.debug("detect: %d candidate regions before dedup", len(cands))
         cands = self._dedupe(cands)
 
         # OCR labeling + booth/zone classification
         if self.run_ocr and _OCR_AVAILABLE and cands:
+            logger.debug("detect: running OCR labeling on %d candidates", len(cands))
             def _label(c):
+                logger.debug("_label() called for bbox=%s", c["bbox_xywh"])
                 x, y, w, h = c["bbox_xywh"]
                 try:
                     c["label"] = _ocr_booth_name(bgr, (x, y, w, h)) or ""
                 except Exception:
+                    logger.exception("_label: OCR failed for bbox=%s", c.get("bbox_xywh"))
                     c["label"] = ""
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
                 list(ex.map(_label, cands))
@@ -267,8 +296,13 @@ class ColorDetector:
             # pillars, banners -- so drop it. Only applied when OCR actually ran,
             # otherwise we'd discard everything.
             if self.ocr_gate:
+                before = len(cands)
                 cands = [c for c in cands if c["label"].strip()]
+                logger.debug("detect: ocr_gate dropped %d candidates with no text (%d -> %d)",
+                             before - len(cands), before, len(cands))
         else:
+            logger.debug("detect: OCR skipped (run_ocr=%s, available=%s, cands=%d)",
+                         self.run_ocr, _OCR_AVAILABLE, len(cands))
             for c in cands:
                 c["label"] = ""
 
@@ -288,4 +322,5 @@ class ColorDetector:
                 "type": "zone" if _is_zone(label) else "booth",
                 "angle": c.get("angle", 0.0),
             })
+        logger.info("detect: returning %d color regions", len(out))
         return out

@@ -12,12 +12,15 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import logging
 import os
 import time
 from pathlib import Path
 from typing import Dict, List
 
 import pipeline as P
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_IN = os.getenv("BATCH_IN", "/data/in")
 DEFAULT_OUT = os.getenv("BATCH_OUT", "/data/out")
@@ -26,14 +29,18 @@ EXTS = (".pdf", ".png", ".jpg", ".jpeg")
 
 def run_batch(indir: str, outdir: str, fp_policy=None,
               only: List[str] = None) -> List[Dict]:
+    logger.debug("run_batch() indir=%s outdir=%s fp_policy=%s only=%s",
+                 indir, outdir, fp_policy, only)
     files = sorted(f for f in glob.glob(f"{indir}/*")
                    if Path(f).suffix.lower() in EXTS)
     if only:
         files = [f for f in files if any(o.lower() in Path(f).name.lower() for o in only)]
+    logger.info("run_batch: %s files to process", len(files))
 
     rows: List[Dict] = []
     for f in files:
         name = Path(f).name
+        logger.info("run_batch: processing %s", name)
         print("\n" + "=" * 78)
         print(f"### {name}")
         print("=" * 78)
@@ -56,6 +63,7 @@ def run_batch(indir: str, outdir: str, fp_policy=None,
                 "ok": True,
             })
         except Exception as e:
+            logger.exception("run_batch: pipeline failed for %s", name)
             import traceback
             traceback.print_exc()
             rows.append({"file": name, "profile": "ERROR",
@@ -66,6 +74,7 @@ def run_batch(indir: str, outdir: str, fp_policy=None,
 
 
 def print_table(rows: List[Dict]) -> None:
+    logger.debug("print_table() rows=%s", len(rows))
     print("\n\n" + "#" * 100)
     print("# ADAPTIVE PIPELINE -- BATCH SUMMARY")
     print("#" * 100)
@@ -85,6 +94,7 @@ def print_table(rows: List[Dict]) -> None:
 
 
 def main(argv=None) -> int:
+    logger.debug("main() argv=%s", argv)
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--indir", default=DEFAULT_IN)
@@ -102,6 +112,7 @@ def main(argv=None) -> int:
     summ.parent.mkdir(parents=True, exist_ok=True)
     with summ.open("w", encoding="utf-8") as fh:
         json.dump(rows, fh, indent=2)
+    logger.info("main: wrote batch summary -> %s (%s rows)", summ, len(rows))
     print(f"\n[batch] summary -> {summ}")
     return 0
 

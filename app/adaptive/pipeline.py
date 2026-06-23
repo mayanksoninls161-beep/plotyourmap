@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -45,6 +46,8 @@ import tiling as TL
 from _detectors import (EnsembleDetector, OpenCVDetector, ColorDetector,
                         BorderedCellDetector)
 
+logger = logging.getLogger(__name__)
+
 
 def _build_detector(cfg: DetectionConfig) -> EnsembleDetector:
     """All sub-detectors run with run_ocr=False: detection is pure geometry and
@@ -52,6 +55,7 @@ def _build_detector(cfg: DetectionConfig) -> EnsembleDetector:
     tesseract dependency in the hot path and is faster. The bordered pass
     self-gates on the presence of white cells, so it is harmless on fully
     colour-coded plans even when enabled."""
+    logger.debug("_build_detector() preset=%s", cfg.preset)
     return EnsembleDetector(
         use_geometric=cfg.use_geometric,
         use_color=cfg.use_color,
@@ -73,6 +77,7 @@ def _build_tiled_detector(cfg: DetectionConfig) -> EnsembleDetector:
     floor is the validated 1.5e-4 of tile area -- small dense stalls survive.
     max_box_area_frac still prunes a hall-outline traced as one giant box per
     tile before it can swallow nested booths."""
+    logger.debug("_build_tiled_detector() preset=%s", cfg.preset)
     return EnsembleDetector(
         use_geometric=cfg.use_geometric,
         use_color=cfg.use_color,
@@ -91,11 +96,14 @@ def run(input_path: str, outdir: str, page_index: int = 0,
         fp_policy: Optional[str] = None,
         prof: Optional[InputProfile] = None,
         verbose: bool = True) -> Dict:
+    logger.debug("run() input=%s outdir=%s page=%s fp_policy=%s verbose=%s",
+                 input_path, outdir, page_index, fp_policy, verbose)
     stem = Path(input_path).stem
     out = Path(outdir) / stem
     out.mkdir(parents=True, exist_ok=True)
 
     def log(msg):
+        logger.info(msg)
         if verbose:
             print(msg, flush=True)
 
@@ -253,6 +261,7 @@ def run(input_path: str, outdir: str, page_index: int = 0,
 
 
 def build_parser() -> argparse.ArgumentParser:
+    logger.debug("build_parser() called")
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("input", help="PDF or image floor-plan path.")
@@ -268,6 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    logger.debug("main() argv=%s", argv)
     args = build_parser().parse_args(argv)
     run(args.input, args.outdir, page_index=args.page, fp_policy=args.fp_policy)
     return 0

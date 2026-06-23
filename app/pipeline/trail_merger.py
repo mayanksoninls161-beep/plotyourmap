@@ -67,6 +67,7 @@ DEFAULT_CONFIG = {
 # ─────────────────────────────────────────────────────────────────
 
 def euclidean(p1, p2):
+    log.debug("euclidean() called")
     return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
 
 
@@ -78,6 +79,7 @@ def _point_seg_dist(p, a, b):
     This is what catches near-parallel overlapping runs (the dashed
     rail-trail tangle) that pure vertex-to-vertex checks miss.
     """
+    log.debug("_point_seg_dist() called")
     ax, ay = a
     bx, by = b
     px, py = p
@@ -92,6 +94,7 @@ def _point_seg_dist(p, a, b):
 
 
 def js_to_px(x_js, y_js, sx, sy):
+    log.debug("js_to_px() called")
     return (int(x_js * sx), int(y_js * sy))
 
 
@@ -100,7 +103,9 @@ def js_to_px(x_js, y_js, sx, sy):
 # ─────────────────────────────────────────────────────────────────
 
 def sample_map_color(pts, map_img, sx, sy):
+    log.debug("sample_map_color() called n_pts=%s", len(pts))
     if len(pts) < 3:
+        log.debug("sample_map_color: too few points (%s), returning default gray", len(pts))
         return (180, 180, 180)
 
     mask = Image.new("L", map_img.size, 0)
@@ -113,9 +118,11 @@ def sample_map_color(pts, map_img, sx, sy):
     y_idx, x_idx = np.where(mask_arr == 255)
 
     if len(y_idx) == 0:
+        log.debug("sample_map_color: empty mask, returning default gray")
         return (180, 180, 180)
 
     pixels = map_arr[y_idx, x_idx]
+    log.debug("sample_map_color: sampling %s masked pixels", len(pixels))
     r = pixels[:, 0].astype(int)
     g = pixels[:, 1].astype(int)
     b = pixels[:, 2].astype(int)
@@ -137,6 +144,7 @@ def sample_map_color(pts, map_img, sx, sy):
 # ─────────────────────────────────────────────────────────────────
 
 def _polygon_to_mask(pts_js, sx, sy, img_w, img_h, padding=5):
+    log.debug("_polygon_to_mask() called n_pts=%s padding=%s", len(pts_js), padding)
     pts_px = [(p[0] * sx, p[1] * sy) for p in pts_js]
     xs = [p[0] for p in pts_px]
     ys = [p[1] for p in pts_px]
@@ -148,8 +156,10 @@ def _polygon_to_mask(pts_js, sx, sy, img_w, img_h, padding=5):
     crop_w = x_max - x_min + 1
     crop_h = y_max - y_min + 1
     if crop_w < 1 or crop_h < 1:
+        log.debug("_polygon_to_mask: degenerate crop (%sx%s), returning empty mask", crop_w, crop_h)
         return np.zeros((1, 1), dtype=bool), x_min, y_min
 
+    log.debug("_polygon_to_mask: crop %sx%s at offset (%s,%s)", crop_w, crop_h, x_min, y_min)
     mask_img = Image.new('L', (crop_w, crop_h), 0)
     d = ImageDraw.Draw(mask_img)
     local_pts = [(p[0] - x_min, p[1] - y_min) for p in pts_px]
@@ -163,13 +173,16 @@ def _skeleton_to_ordered_path(skel):
     Skeleton → ordered pixel path with branch pruning.
     Decomposes at junctions, finds longest spine, prunes spurs.
     """
+    log.debug("_skeleton_to_ordered_path() called n_skel_px=%s", int(skel.sum()))
     rows, cols = np.where(skel)
     if len(rows) == 0:
+        log.debug("_skeleton_to_ordered_path: empty skeleton, returning []")
         return []
 
     coords = list(zip(rows.tolist(), cols.tolist()))
     coord_to_idx = {c: i for i, c in enumerate(coords)}
     n_pts = len(coords)
+    log.debug("_skeleton_to_ordered_path: building adjacency over %s skeleton points", n_pts)
 
     adj = defaultdict(set)
     for i, (r, c) in enumerate(coords):
@@ -185,10 +198,13 @@ def _skeleton_to_ordered_path(skel):
 
     degree = {i: len(adj[i]) for i in range(n_pts)}
     junctions = {i for i in range(n_pts) if degree[i] >= 3}
+    log.debug("_skeleton_to_ordered_path: found %s junction(s)", len(junctions))
 
     # ── No junctions: simple BFS diameter ──────────────────────
     if not junctions:
+        log.debug("_skeleton_to_ordered_path: no junctions, using BFS diameter")
         def bfs_far(start):
+            log.debug("bfs_far() called start=%s", start)
             vis = {start: None}
             q = deque([start])
             far = start
@@ -209,6 +225,7 @@ def _skeleton_to_ordered_path(skel):
             path.append(coords[cur])
             cur = parents[cur]
         path.reverse()
+        log.debug("_skeleton_to_ordered_path: no-junction path length=%s", len(path))
         return path
 
     # ── Decompose into branches ────────────────────────────────
@@ -216,6 +233,7 @@ def _skeleton_to_ordered_path(skel):
     branches = []
     visited_edges = set()
     starts = junctions | endpoints
+    log.debug("_skeleton_to_ordered_path: decomposing into branches from %s start node(s)", len(starts))
 
     for s in starts:
         for nb in adj[s]:
@@ -235,8 +253,12 @@ def _skeleton_to_ordered_path(skel):
             branch.append(cur)
             branches.append(branch)
 
+    log.debug("_skeleton_to_ordered_path: decomposed into %s branch(es)", len(branches))
+
     if not branches:
+        log.debug("_skeleton_to_ordered_path: no branches found, falling back to BFS diameter")
         def bfs_far(start):
+            log.debug("bfs_far() called start=%s", start)
             vis = {start: None}
             q = deque([start])
             far = start
@@ -256,9 +278,11 @@ def _skeleton_to_ordered_path(skel):
             path.append(coords[cur])
             cur = parents[cur]
         path.reverse()
+        log.debug("_skeleton_to_ordered_path: branch-fallback path length=%s", len(path))
         return path
 
     # ── Branch-level graph → longest spine ─────────────────────
+    log.debug("_skeleton_to_ordered_path: building branch-level graph for longest spine")
     branch_adj = defaultdict(list)
     for bi, branch in enumerate(branches):
         a, b = branch[0], branch[-1]
@@ -276,6 +300,7 @@ def _skeleton_to_ordered_path(skel):
     graph_eps = [n for n in graph_nodes if br_deg[n] == 1]
     if len(graph_eps) < 2:
         graph_eps = list(graph_nodes)
+    log.debug("_skeleton_to_ordered_path: %s graph endpoint(s) to search for spine", len(graph_eps))
 
     best_branches = []
     best_len = 0
@@ -305,8 +330,11 @@ def _skeleton_to_ordered_path(skel):
             best_branches = pb
 
     if not best_branches:
+        log.debug("_skeleton_to_ordered_path: no spine found, returning longest single branch")
         longest = max(branches, key=len)
         return [coords[i] for i in longest]
+
+    log.debug("_skeleton_to_ordered_path: spine has %s branch(es), best_len=%s", len(best_branches), best_len)
 
     # ── Walk spine branches in order ───────────────────────────
     spine_set = set(best_branches)
@@ -339,11 +367,14 @@ def _skeleton_to_ordered_path(skel):
         if not found:
             break
 
+    log.debug("_skeleton_to_ordered_path: stitched spine path length=%s", len(spine_px))
     return spine_px if spine_px else [coords[i] for i in max(branches, key=len)]
 
 
 def _smooth_path(pts, window=5):
+    log.debug("_smooth_path() called n_pts=%s window=%s", len(pts), window)
     if len(pts) <= window:
+        log.debug("_smooth_path: too few points (%s) for window %s, returning unchanged", len(pts), window)
         return pts
     arr = np.array(pts, dtype=float)
     smoothed = np.copy(arr)
@@ -356,6 +387,7 @@ def _smooth_path(pts, window=5):
 
 
 def _simplify_rdp(pts, epsilon=1.5):
+    log.debug("_simplify_rdp() called n_pts=%s epsilon=%s", len(pts), epsilon)
     if len(pts) <= 2:
         return pts
     start = np.array(pts[0], dtype=float)
@@ -382,6 +414,7 @@ def _simplify_rdp(pts, epsilon=1.5):
 
 def _densify(pts, max_dist):
     """Insert linearly-interpolated points so no consecutive gap exceeds max_dist."""
+    log.debug("_densify() called n_pts=%s max_dist=%s", len(pts), max_dist)
     if len(pts) < 2 or max_dist <= 0:
         return pts
     result = [pts[0]]
@@ -396,6 +429,7 @@ def _densify(pts, max_dist):
                 ip = p0 + t * (p1 - p0)
                 result.append((round(float(ip[0]), 3), round(float(ip[1]), 3)))
         result.append(pts[i])
+    log.debug("_densify: %s points in, %s points out", len(pts), len(result))
     return result
 
 
@@ -404,7 +438,9 @@ def extract_centerline(polygon_pts, sx, sy, img_w, img_h, cfg):
     Polygon → skeleton → ordered centerline in JSON coords.
     Returns list of (x_js, y_js). Endpoints are skeleton tips.
     """
+    log.debug("extract_centerline() called n_polygon_pts=%s", len(polygon_pts))
     if len(polygon_pts) < 3:
+        log.debug("extract_centerline: degenerate polygon (%s pts), returning raw points", len(polygon_pts))
         return list(polygon_pts)
 
     mask, off_x, off_y = _polygon_to_mask(
@@ -412,16 +448,20 @@ def extract_centerline(polygon_pts, sx, sy, img_w, img_h, cfg):
         padding=cfg.get("skeleton_padding", 5)
     )
     if mask.sum() < 3:
+        log.debug("extract_centerline: mask too small (%s px), returning stub centerline", int(mask.sum()))
         return [polygon_pts[0], polygon_pts[len(polygon_pts) // 2]]
 
     skel = skeletonize(mask)
     if skel.sum() == 0:
+        log.debug("extract_centerline: empty skeleton, returning stub centerline")
         return [polygon_pts[0], polygon_pts[len(polygon_pts) // 2]]
 
     ordered_px = _skeleton_to_ordered_path(skel)
     if len(ordered_px) < 2:
+        log.debug("extract_centerline: ordered path too short (%s), returning stub centerline", len(ordered_px))
         return [polygon_pts[0], polygon_pts[len(polygon_pts) // 2]]
 
+    log.debug("extract_centerline: ordered skeleton path has %s points; smoothing + simplifying", len(ordered_px))
     ordered_px = _smooth_path(ordered_px, window=cfg.get("smooth_window", 5))
     ordered_px = _simplify_rdp(ordered_px, epsilon=cfg.get("simplify_epsilon", 1.5))
 
@@ -435,6 +475,7 @@ def extract_centerline(polygon_pts, sx, sy, img_w, img_h, cfg):
     if max_gap and max_gap > 0:
         centerline_js = _densify(centerline_js, max_gap)
 
+    log.debug("extract_centerline: final centerline has %s points", len(centerline_js))
     return centerline_js
 
 
@@ -450,6 +491,7 @@ def cluster_by_color(segments, max_clusters, color_merge_thresh=0.25):
     over-splitting from keeping visually identical trail colors in separate
     clusters.
     """
+    log.debug("cluster_by_color() called n_segments=%s max_clusters=%s", len(segments), max_clusters)
     rgb_arr = np.array([s["map_color"] for s in segments], dtype=float) / 255.0
 
     features = []
@@ -462,6 +504,7 @@ def cluster_by_color(segments, max_clusters, color_merge_thresh=0.25):
     mat = np.array(features, dtype=float)
     best_score, best_labels = -1.0, None
     max_k = min(max_clusters, len(segments) - 1)
+    log.debug("cluster_by_color: searching k in [2, %s] via silhouette", max_k)
 
     if max_k >= 2:
         for k in range(2, max_k + 1):
@@ -474,13 +517,17 @@ def cluster_by_color(segments, max_clusters, color_merge_thresh=0.25):
                 if score > best_score:
                     best_score, best_labels = score, labels.copy()
             except ValueError:
+                log.exception("cluster_by_color: silhouette_score failed for k=%s", k)
                 continue
+        log.debug("cluster_by_color: best silhouette score=%.4f", best_score)
 
     if best_labels is None:
+        log.debug("cluster_by_color: no valid clustering found, assigning all to single cluster")
         best_labels = np.zeros(len(segments), dtype=int)
 
     # ── Post-merge: collapse clusters whose RGB centroids are too similar ──
     unique = sorted(set(best_labels.tolist()))
+    log.debug("cluster_by_color: %s cluster(s) before post-merge", len(unique))
     if len(unique) > 1:
         centroids = {}
         for cl in unique:
@@ -490,6 +537,7 @@ def cluster_by_color(segments, max_clusters, color_merge_thresh=0.25):
         parent = {cl: cl for cl in unique}
 
         def find(x):
+            log.debug("find() called x=%s", x)
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
                 x = parent[x]
@@ -506,8 +554,10 @@ def cluster_by_color(segments, max_clusters, color_merge_thresh=0.25):
         canon = {cl: find(cl) for cl in unique}
         new_ids = {old: new for new, old in enumerate(sorted(set(canon.values())))}
         best_labels = np.array([new_ids[canon[lbl]] for lbl in best_labels.tolist()])
+        log.debug("cluster_by_color: post-merge collapsed to %s cluster(s)", len(new_ids))
 
     n_final = len(set(best_labels.tolist()))
+    log.debug("cluster_by_color: %s final cluster(s)", n_final)
     return best_labels, n_final, None
 
 
@@ -517,20 +567,24 @@ def cluster_by_color(segments, max_clusters, color_merge_thresh=0.25):
 
 class UnionFind:
     def __init__(self, n):
+        log.debug("UnionFind.__init__() called n=%s", n)
         self._parent = list(range(n))
 
     def find(self, x):
+        log.debug("find() called x=%s", x)
         while self._parent[x] != x:
             self._parent[x] = self._parent[self._parent[x]]
             x = self._parent[x]
         return x
 
     def union(self, a, b):
+        log.debug("union() called a=%s b=%s", a, b)
         ra, rb = self.find(a), self.find(b)
         if ra != rb:
             self._parent[rb] = ra
 
     def same(self, a, b):
+        log.debug("same() called a=%s b=%s", a, b)
         return self.find(a) == self.find(b)
 
 
@@ -544,6 +598,8 @@ def find_bridges(segments, merge_dist, cross_merge_dist, cross_cluster_merge):
     Each segment has exactly 2 ports. Same-side constraint is enforced
     by the ep_free dict (once a port is used, it's locked).
     """
+    log.debug("find_bridges() called n_segments=%s merge_dist=%.2f cross_merge_dist=%.2f cross_cluster_merge=%s",
+              len(segments), merge_dist, cross_merge_dist, cross_cluster_merge)
     n = len(segments)
     uf = UnionFind(n)
     ep_free = {}
@@ -554,6 +610,7 @@ def find_bridges(segments, merge_dist, cross_merge_dist, cross_cluster_merge):
     bridges = []
 
     def _candidates(same_cluster, max_dist):
+        log.debug("_candidates() called same_cluster=%s max_dist=%.2f", same_cluster, max_dist)
         cands = []
         for i in range(n):
             for j in range(i + 1, n):
@@ -573,9 +630,11 @@ def find_bridges(segments, merge_dist, cross_merge_dist, cross_cluster_merge):
                     if d < max_dist:
                         cands.append((d, i, j, ea, eb, pa, pb))
         cands.sort()
+        log.debug("_candidates: %s candidate endpoint pair(s) within %.2f", len(cands), max_dist)
         return cands
 
     def _greedy(candidates, cross):
+        log.debug("_greedy() called n_candidates=%s cross=%s", len(candidates), cross)
         count = 0
         for d, i, j, ea, eb, pa, pb in candidates:
             if not (ep_free.get((i, ea)) and ep_free.get((j, eb))):
@@ -600,15 +659,19 @@ def find_bridges(segments, merge_dist, cross_merge_dist, cross_cluster_merge):
             ep_free[(j, eb)] = False
             uf.union(i, j)
             count += 1
+        log.debug("_greedy: formed %s bridge(s) (cross=%s)", count, cross)
         return count
 
+    log.debug("find_bridges: same-cluster pass")
     same_cands = _candidates(same_cluster=True, max_dist=merge_dist)
     _greedy(same_cands, cross=False)
 
     if cross_cluster_merge:
+        log.debug("find_bridges: cross-cluster pass")
         cross_cands = _candidates(same_cluster=False, max_dist=cross_merge_dist)
         _greedy(cross_cands, cross=True)
 
+    log.debug("find_bridges: %s total bridge(s) formed", len(bridges))
     return bridges, uf
 
 
@@ -617,11 +680,13 @@ def find_bridges(segments, merge_dist, cross_merge_dist, cross_cluster_merge):
 # ─────────────────────────────────────────────────────────────────
 
 def _build_adj(bridges):
+    log.debug("_build_adj() called n_bridges=%s", len(bridges))
     adj = defaultdict(list)
     for b in bridges:
         i, j = b["seg_i"], b["seg_j"]
         adj[i].append((j, b["ep_i"], b["ep_j"], b))
         adj[j].append((i, b["ep_j"], b["ep_i"], b))
+    log.debug("_build_adj: adjacency built over %s node(s)", len(adj))
     return adj
 
 
@@ -635,12 +700,15 @@ def _find_diameter_chain(seg_indices, adj):
     At Y-junctions the shorter branches are dropped, giving a single
     non-backtracking polyline from one leaf to the farthest leaf.
     """
+    log.debug("_find_diameter_chain() called n_seg_indices=%s", len(seg_indices))
     if len(seg_indices) == 1:
+        log.debug("_find_diameter_chain: single segment, returning trivial chain")
         return [(seg_indices[0], None, None, None)]
 
     seg_set = set(seg_indices)
 
     def bfs_far(start):
+        log.debug("bfs_far() called start=%s", start)
         dist = {start: 0}
         # arrival[node] = (parent_seg, exit_port_of_parent, entry_port_of_node, bridge)
         arrival = {start: None}
@@ -659,6 +727,7 @@ def _find_diameter_chain(seg_indices, adj):
 
     f1, _ = bfs_far(seg_indices[0])
     f2, arrival = bfs_far(f1)
+    log.debug("_find_diameter_chain: diameter endpoints f1=%s f2=%s", f1, f2)
 
     # Reconstruct path f1 → f2
     path = []
@@ -685,6 +754,7 @@ def _find_diameter_chain(seg_indices, adj):
 
         chain.append((seg_idx, entry_port, exit_port, bridge))
 
+    log.debug("_find_diameter_chain: chain length=%s segment(s)", len(chain))
     return chain
 
 
@@ -698,6 +768,7 @@ def _trim_junction_overlap(full_line, cl, tol=1.0):
     until Q is no longer behind, then trims the head of cl for any remaining
     overlap, so the junction always moves forward.
     """
+    log.debug("_trim_junction_overlap() called n_full_line=%s n_cl=%s tol=%s", len(full_line), len(cl), tol)
     if len(full_line) < 2 or len(cl) < 2:
         return full_line, cl
 
@@ -738,6 +809,7 @@ def _trim_junction_overlap(full_line, cl, tol=1.0):
                     break
                 cl_work.pop(0)
 
+    log.debug("_trim_junction_overlap: trimmed to n_full_line=%s n_cl=%s", len(result), len(cl_work))
     return result, cl_work
 
 
@@ -756,7 +828,9 @@ def stitch_group_centerline(seg_indices, segments, adj):
       full_line back to that earlier attachment point so the path never
       doubles back — implementing "merge from the nearest point available".
     """
+    log.debug("stitch_group_centerline() called n_seg_indices=%s", len(seg_indices))
     if len(seg_indices) == 1:
+        log.debug("stitch_group_centerline: single segment, returning its centerline")
         return list(segments[seg_indices[0]]["centerline"])
 
     chain = _find_diameter_chain(seg_indices, adj)
@@ -803,6 +877,7 @@ def stitch_group_centerline(seg_indices, segments, adj):
                     best_dist = d
                     best_idx  = k
             if best_idx < len(full_line) - 1:
+                log.debug("stitch_group_centerline: step %s nearest-attachment trim to idx %s", step_idx, best_idx)
                 full_line = full_line[:best_idx + 1]
 
             # ── Normal overlap trim + append ────────────────────────
@@ -815,7 +890,10 @@ def stitch_group_centerline(seg_indices, segments, adj):
                 full_line.extend(cl)
         else:
             full_line.extend(cl)
+        log.debug("stitch_group_centerline: after step %s (seg %s) full_line has %s point(s)",
+                  step_idx, seg_idx, len(full_line))
 
+    log.debug("stitch_group_centerline: stitched %s point(s) from %s segment(s)", len(full_line), len(chain))
     return full_line
 
 
@@ -832,12 +910,13 @@ def _remove_backtracking(pts, lookback=35, threshold=15.0):
     forward-moving polyline with no backtracking — never multiple separate
     records that would be drawn as overlapping lines.
     """
+    log.debug("_remove_backtracking() called n_pts=%s lookback=%s threshold=%s", len(pts), lookback, threshold)
     if len(pts) < lookback + 5:
         return list(pts)
 
     result = list(pts)
 
-    for _ in range(20):   # max passes — almost always done in 1–3
+    for pass_idx in range(20):   # max passes — almost always done in 1–3
         if len(result) < lookback + 5:
             break
         excised = False
@@ -852,7 +931,9 @@ def _remove_backtracking(pts, lookback=35, threshold=15.0):
                 break
         if not excised:
             break
+        log.debug("_remove_backtracking: pass %s excised a loop, now %s point(s)", pass_idx, len(result))
 
+    log.debug("_remove_backtracking: %s point(s) in, %s point(s) out", len(pts), len(result))
     return result
 
 
@@ -873,11 +954,13 @@ def _remove_self_overlap(pts, lookback=6, threshold=16.0, max_passes=40):
     can be removed; small enough to catch a tight knot at a single crossing,
     large enough that a straight densified run never matches itself.
     """
+    log.debug("_remove_self_overlap() called n_pts=%s lookback=%s threshold=%s max_passes=%s",
+              len(pts), lookback, threshold, max_passes)
     if len(pts) < lookback + 3:
         return list(pts)
 
     result = list(pts)
-    for _ in range(max_passes):
+    for pass_idx in range(max_passes):
         if len(result) < lookback + 3:
             break
         cut = None
@@ -893,7 +976,10 @@ def _remove_self_overlap(pts, lookback=6, threshold=16.0, max_passes=40):
             break
         k, i = cut
         result = result[:k + 1] + result[i:]
+        log.debug("_remove_self_overlap: pass %s excised tangle [%s:%s], now %s point(s)",
+                  pass_idx, k, i, len(result))
 
+    log.debug("_remove_self_overlap: %s point(s) in, %s point(s) out", len(pts), len(result))
     return result
 
 
@@ -902,6 +988,7 @@ def _remove_self_overlap(pts, lookback=6, threshold=16.0, max_passes=40):
 # ─────────────────────────────────────────────────────────────────
 
 def _bbox_from_pts(pts):
+    log.debug("_bbox_from_pts() called n_pts=%s", len(pts))
     xs = [p[0] for p in pts]
     ys = [p[1] for p in pts]
     xn, xx = min(xs), max(xs)
@@ -910,6 +997,7 @@ def _bbox_from_pts(pts):
 
 
 def _iou_bbox(a, b):
+    log.debug("_iou_bbox() called")
     ax1, ax2 = a["x"] - a["width"] / 2, a["x"] + a["width"] / 2
     ay1, ay2 = a["y"] - a["height"] / 2, a["y"] + a["height"] / 2
     bx1, bx2 = b["x"] - b["width"] / 2, b["x"] + b["width"] / 2
@@ -924,6 +1012,7 @@ def _iou_bbox(a, b):
 
 
 def apply_nms(records, iou_thresh):
+    log.debug("apply_nms() called n_records=%s iou_thresh=%s", len(records), iou_thresh)
     sr = sorted(records, key=lambda r: r["confidence"], reverse=True)
     kept, suppressed = [], set()
     for i, rec in enumerate(sr):
@@ -933,6 +1022,7 @@ def apply_nms(records, iou_thresh):
         for j in range(i + 1, len(sr)):
             if j not in suppressed and _iou_bbox(rec, sr[j]) > iou_thresh:
                 suppressed.add(j)
+    log.debug("apply_nms: kept %s of %s record(s) (suppressed %s)", len(kept), len(records), len(suppressed))
     return kept
 
 
@@ -941,10 +1031,12 @@ def apply_nms(records, iou_thresh):
 # ─────────────────────────────────────────────────────────────────
 
 def detect_js_dimensions(trail_block):
+    log.debug("detect_js_dimensions() called")
     image_info = trail_block.get("image", {})
     js_w = image_info.get("width")
     js_h = image_info.get("height")
     if js_w and js_h:
+        log.debug("detect_js_dimensions: using image block dims %sx%s", js_w, js_h)
         return int(js_w), int(js_h)
 
     predictions = trail_block.get("predictions", [])
@@ -955,8 +1047,11 @@ def detect_js_dimensions(trail_block):
                 mx = max(mx, pt.get("x", 0))
                 my = max(my, pt.get("y", 0))
         if mx > 0 and my > 0:
+            log.debug("detect_js_dimensions: inferred dims from %s prediction(s) max=(%.1f,%.1f)",
+                      len(predictions), mx, my)
             return int(math.ceil(mx * 1.05)), int(math.ceil(my * 1.05))
 
+    log.debug("detect_js_dimensions: falling back to default 2100x1275")
     return 2100, 1275
 
 
@@ -976,11 +1071,13 @@ def merge_trails(predictions, map_image, config=None, trail_block=None):
 
     Returns list of merged prediction dicts.
     """
+    log.debug("merge_trails() called n_predictions=%s", len(predictions))
     cfg = {**DEFAULT_CONFIG, **(config or {})}
 
     # ── Resolve JS coordinate space ────────────────────────────
     js_w, js_h = cfg["js_w"], cfg["js_h"]
     if js_w is None or js_h is None:
+        log.debug("merge_trails: js dimensions not configured, auto-detecting")
         src = trail_block if trail_block else {"predictions": predictions}
         js_w, js_h = detect_js_dimensions(src)
 
@@ -1036,6 +1133,7 @@ def merge_trails(predictions, map_image, config=None, trail_block=None):
     log.info("Segments with valid centerlines: %d", len(segments))
 
     if not segments:
+        log.debug("merge_trails: no valid segments, returning empty result")
         return []
 
     # ══════════════════════════════════════════════════════════════
@@ -1097,6 +1195,7 @@ def merge_trails(predictions, map_image, config=None, trail_block=None):
 
     merged_records = []
     for root, seg_indices in groups.items():
+        log.debug("merge_trails: building group root=%s from %s segment(s)", root, len(seg_indices))
         source_preds = [predictions[segments[i]["orig_pred_idx"]]
                         for i in seg_indices]
         best_conf = max(p.get("confidence", 0.0) for p in source_preds)
