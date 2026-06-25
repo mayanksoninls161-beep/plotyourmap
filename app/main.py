@@ -43,12 +43,14 @@ for _p in (_PIPE, _ADAPT):
 os.environ.setdefault("BOOTH_DETECTOR_ROOT", _PIPE)
 
 import asyncio
+import concurrent.futures
 import glob
 import hashlib
 import json
 import logging
 import shutil
 import tempfile
+import threading
 from datetime import datetime
 from io import BytesIO
 
@@ -56,7 +58,7 @@ import cv2
 import httpx
 import imagehash
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Security, UploadFile, status
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Security, UploadFile, status
 from fastapi.security import APIKeyHeader
 from PIL import Image
 
@@ -81,6 +83,14 @@ import pipeline as adaptive_pipeline
 
 load_dotenv()
 os.environ["ONNXRUNTIME_EXECUTION_PROVIDERS"] = "CPUExecutionProvider"
+# Give ONNX Runtime and OpenMP as many threads as there are physical cores so
+# each model inference uses all available CPU parallelism. The concurrency
+# semaphores in this file control how many requests run at once, so letting
+# each individual inference saturate the CPU is the right trade-off.
+_ORT_THREADS = str(max(1, os.cpu_count() or 4))
+os.environ.setdefault("OMP_NUM_THREADS", _ORT_THREADS)
+os.environ.setdefault("ONNXRUNTIME_INTRA_OP_NUM_THREADS", _ORT_THREADS)
+os.environ.setdefault("ONNXRUNTIME_INTER_OP_NUM_THREADS", _ORT_THREADS)
 
 _LOG_PATH = setup_logging()
 logger = logging.getLogger(__name__)
@@ -105,14 +115,14 @@ async def require_api_key(key: str = Security(_api_key_header)):
         )
 
 
-app = FastAPI(title="Adaptive Booth API")
+app = FastAPI(title="OuterMap-Indoor_and_Outdoor")
 
 # ─────────────────────────────────────────────────────────────────
 # MODEL SETUP  (lazy: download/connect on first use, not at import)
 # ─────────────────────────────────────────────────────────────────
 _MODEL_SPECS = {
     "icon": ("ROBOFLOW_ICON_API_KEY", "plotmymap_synthetic/2"),
-    "trail": ("ROBOFLOW_TRAIL_API_KEY", "the-trails-1gyc4/11"),
+    "trail": ("ROBOFLOW_TRAIL_API_KEY", "trails-lyj7i/9"),
     "hall": ("ROBOFLOW_HALL_API_KEY", "hall_detection/6"),
 }
 _models: dict = {}
@@ -120,18 +130,21 @@ _models: dict = {}
 
 def _get_rf_model(kind: str):
     """Lazily construct (and cache) a Roboflow model. Raises 500 if its key is
-    missing so booth-only endpoints can still run without Roboflow keys."""
+    missing so booth-only endpoints can still run without Roboflow keys.
+    Thread-safe: may be called from executor threads."""
     logger.debug("_get_rf_model() kind=%s", kind)
     if kind not in _models:
-        logger.debug("_get_rf_model: model %s not cached; constructing", kind)
-        env_name, model_id = _MODEL_SPECS[kind]
-        key = os.getenv(env_name)
-        if not key:
-            raise HTTPException(status_code=500,
-                                detail=f"{env_name} is not set")
-        from inference import get_model
-        logger.info("Loading Roboflow model %s (%s)", kind, model_id)
-        _models[kind] = get_model(model_id=model_id, api_key=key)
+        with _model_lock:
+            if kind not in _models:
+                logger.debug("_get_rf_model: model %s not cached; constructing", kind)
+                env_name, model_id = _MODEL_SPECS[kind]
+                key = os.getenv(env_name)
+                if not key:
+                    raise HTTPException(status_code=500,
+                                        detail=f"{env_name} is not set")
+                from inference import get_model
+                logger.info("Loading Roboflow model %s (%s)", kind, model_id)
+                _models[kind] = get_model(model_id=model_id, api_key=key)
     return _models[kind]
 
 
@@ -147,12 +160,38 @@ HALL_RASTER_MAX_EDGE = int(os.getenv("HALL_RASTER_MAX_EDGE", "2048"))
 # /predict PDF rendering (pypdfium2 — same renderer as the adaptive engine).
 PREDICT_PDF_DPI = int(os.getenv("PREDICT_PDF_DPI", "200"))
 PREDICT_PDF_MAX_EDGE = int(os.getenv("PREDICT_PDF_MAX_EDGE", "2048"))
+# Cap raw images at this edge length before sending to the Roboflow models.
+# Reduces model preprocessing + inference + trail-postprocessing time significantly
+# for large images. Coordinates are scaled back to the original image space after
+# inference so the output dimensions are always in the caller's pixel space.
+# Set to 0 to disable (pass raw bytes; slower for large images).
+PREDICT_IMAGE_MAX_EDGE = int(os.getenv("PREDICT_IMAGE_MAX_EDGE", "1280"))
 
 PERSIST_ENABLED = os.getenv("PERSIST_EXECUTIONS", "true").lower() == "true"
 PERSIST_IN_DIR = os.getenv("PERSIST_IN_DIR", "/data/in")
 PERSIST_OUT_DIR = os.getenv("PERSIST_OUT_DIR", "/data/out")
 
+# ─────────────────────────────────────────────────────────────────
+# CONCURRENCY / RESOURCE ALLOCATION
+# ─────────────────────────────────────────────────────────────────
+# All CPU-bound and blocking I/O work is dispatched to this pool.
+# Size it to the number of real CPU cores available to the process.
+_MAX_WORKERS = int(os.getenv("MAX_WORKERS", str(min(32, (os.cpu_count() or 4) * 2))))
+
+# Hard cap on concurrent adaptive-booth pipeline calls: each call can
+# consume several GB of memory and all available cores, so keep the cap
+# small (1-2 per available GPU/CPU socket) and let the async event loop
+# queue any overflow.
+_MAX_CONCURRENT_BOOTH = int(os.getenv("MAX_CONCURRENT_BOOTH", "2"))
+_MAX_CONCURRENT_PREDICT = int(os.getenv("MAX_CONCURRENT_PREDICT", "4"))
+
+_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_MAX_WORKERS, thread_name_prefix="api_worker"
+)
+_booth_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_BOOTH)
+_predict_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_PREDICT)
 _hash_db_lock = asyncio.Lock()
+_model_lock = threading.Lock()
 
 
 def _persist_execution(endpoint, input_bytes, input_name, result) -> None:
@@ -223,7 +262,7 @@ async def run_model_async(model, image_data, confidence: float):
     loop = asyncio.get_event_loop()
     logger.info("run_model_async: starting inference at confidence=%s", confidence)
     return await loop.run_in_executor(
-        None, lambda: model.infer(image_data, confidence=confidence))
+        _executor, lambda: model.infer(image_data, confidence=confidence))
 
 
 def compute_hash_from_bytes(raw_bytes: bytes) -> str:
@@ -236,17 +275,17 @@ async def get_or_compute_hash(raw_bytes: bytes, extra: dict = None):
     logger.debug("get_or_compute_hash() len=%s", len(raw_bytes))
     loop = asyncio.get_event_loop()
     existing_hash, existing_date = await loop.run_in_executor(
-        None, read_image_metadata, raw_bytes)
+        _executor, read_image_metadata, raw_bytes)
     if existing_hash and existing_date:
         logger.debug("get_or_compute_hash: found embedded hash=%s date=%s",
                      existing_hash, existing_date)
         return existing_hash, existing_date, raw_bytes, False
     logger.debug("get_or_compute_hash: no embedded metadata; computing phash")
-    phash = await loop.run_in_executor(None, compute_hash_from_bytes, raw_bytes)
+    phash = await loop.run_in_executor(_executor, compute_hash_from_bytes, raw_bytes)
     updated_bytes = await loop.run_in_executor(
-        None, lambda: write_image_metadata(raw_bytes, phash, None, extra))
+        _executor, lambda: write_image_metadata(raw_bytes, phash, None, extra))
     _, written_date = await loop.run_in_executor(
-        None, read_image_metadata, updated_bytes)
+        _executor, read_image_metadata, updated_bytes)
     was_written = updated_bytes is not raw_bytes and len(updated_bytes) != len(raw_bytes)
     logger.debug("get_or_compute_hash: phash=%s was_written=%s", phash, was_written)
     return phash, written_date, updated_bytes, was_written
@@ -256,12 +295,12 @@ async def check_and_register_hash(img_hash: str) -> bool:
     logger.debug("check_and_register_hash() img_hash=%s", img_hash)
     loop = asyncio.get_event_loop()
     async with _hash_db_lock:
-        hash_db = await loop.run_in_executor(None, load_hash_db)
+        hash_db = await loop.run_in_executor(_executor, load_hash_db)
         if img_hash in hash_db:
             logger.debug("check_and_register_hash: hash already present")
             return True
         hash_db.add(img_hash)
-        await loop.run_in_executor(None, save_hash_db, hash_db)
+        await loop.run_in_executor(_executor, save_hash_db, hash_db)
         logger.debug("check_and_register_hash: registered new hash")
         return False
 
@@ -280,7 +319,7 @@ async def writeback_to_s3(image_url: str, modified_bytes: bytes) -> dict:
     loop = asyncio.get_event_loop()
     logger.info("writeback_to_s3: uploading to bucket=%s key=%s region=%s", bucket, key, region)
     upload_result = await loop.run_in_executor(
-        None, upload_bytes_to_s3, bucket, key, modified_bytes, region, ctype)
+        _executor, upload_bytes_to_s3, bucket, key, modified_bytes, region, ctype)
     response = {"attempted": True, "success": upload_result["success"],
                 "bucket": bucket, "key": key, "region": region,
                 "content_type": ctype}
@@ -428,6 +467,69 @@ def _render_pdf_page(pdf_bytes: bytes, dpi: int = PREDICT_PDF_DPI,
     pil.save(buf, format="PNG")
     logger.info("_render_pdf_page: rendered page -> %sx%s px", pil.size[0], pil.size[1])
     return buf.getvalue(), pil
+
+
+def _cap_image_for_infer(raw: bytes, max_edge: int):
+    """Resize a raw image so its longest edge <= max_edge before model inference.
+
+    Returns (infer_bytes, map_image_pil, scale_back):
+      infer_bytes  – JPEG bytes at the capped resolution (fed to the Roboflow models).
+      map_image_pil – PIL image at the same capped resolution (used by postprocess_trails).
+      scale_back   – multiply every inference-space coordinate by this to convert back
+                     to the original image's pixel space.
+
+    If the image is already within max_edge (or max_edge <= 0) the original bytes are
+    returned unchanged and scale_back is 1.0.
+    """
+    img = Image.open(BytesIO(raw)).convert("RGB")
+    orig_w, orig_h = img.size
+    long_edge = max(orig_w, orig_h)
+    if max_edge <= 0 or long_edge <= max_edge:
+        return raw, img, 1.0
+    scale = max_edge / long_edge
+    new_w = max(1, round(orig_w * scale))
+    new_h = max(1, round(orig_h * scale))
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    buf = BytesIO()
+    resized.save(buf, format="JPEG", quality=90)
+    scale_back = 1.0 / scale      # = orig_long_edge / max_edge
+    logger.info("_cap_image_for_infer: %dx%d → %dx%d (scale_back=%.3f)",
+                orig_w, orig_h, new_w, new_h, scale_back)
+    return buf.getvalue(), resized, scale_back
+
+
+def _scale_coords(preds: list, scale: float) -> list:
+    """Multiply bbox and segmentation-point coordinates by scale."""
+    if scale == 1.0 or not preds:
+        return preds
+    out = []
+    for p in preds:
+        p = dict(p)
+        for k in ("x", "y", "width", "height"):
+            if isinstance(p.get(k), (int, float)):
+                p[k] = p[k] * scale
+        if "points" in p:
+            p["points"] = [
+                {**pt, "x": pt.get("x", 0) * scale, "y": pt.get("y", 0) * scale}
+                for pt in p["points"]
+            ]
+        out.append(p)
+    return out
+
+
+def _scale_infer_block(block, scale: float):
+    """Scale a serialized model-output block (dict with 'predictions' + 'image')."""
+    if not isinstance(block, dict) or scale == 1.0:
+        return block
+    block = dict(block)
+    block["predictions"] = _scale_coords(block.get("predictions", []), scale)
+    img = block.get("image")
+    if isinstance(img, dict):
+        block["image"] = dict(img)
+        for dim in ("width", "height"):
+            if isinstance(img.get(dim), (int, float)):
+                block["image"][dim] = round(img[dim] * scale)
+    return block
 
 
 def _run_adaptive_booths(src_bytes: bytes, src_name: str, is_pdf: bool,
@@ -665,7 +767,7 @@ async def _hash_fields(src_bytes: bytes, is_pdf: bool, render_bgr):
                 logger.debug("_ph() called")
                 rgb = cv2.cvtColor(render_bgr, cv2.COLOR_BGR2RGB)
                 return str(imagehash.phash(Image.fromarray(rgb)))
-            img_hash = await loop.run_in_executor(None, _ph)
+            img_hash = await loop.run_in_executor(_executor, _ph)
     except Exception:
         logger.exception("hash computation failed; falling back to sha1")
     if not img_hash:
@@ -677,6 +779,20 @@ async def _hash_fields(src_bytes: bytes, is_pdf: bool, render_bgr):
 
 
 # ─────────────────────────────────────────────────────────────────
+# STARTUP: pre-load models so the first real request pays no cold-start penalty
+# ─────────────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def _warm_models():
+    loop = asyncio.get_event_loop()
+    for kind in ("trail", "icon", "hall"):
+        try:
+            await loop.run_in_executor(_executor, _get_rf_model, kind)
+            logger.info("startup: model '%s' warmed up", kind)
+        except Exception:
+            logger.warning("startup: could not pre-load model '%s' (will load on first use)", kind)
+
+
+# ─────────────────────────────────────────────────────────────────
 # DEBUG ENDPOINT  (unchanged from main)
 # ─────────────────────────────────────────────────────────────────
 @app.post("/debug_predict")
@@ -684,6 +800,7 @@ async def debug_predict(
     file: UploadFile = File(None),
     image_url: str = Form(None),
     _: None = Security(require_api_key),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
 ):
     logger.info("debug_predict endpoint hit: file=%s image_url=%s",
                 bool(file), bool(image_url))
@@ -715,8 +832,9 @@ async def debug_predict(
             "first_pred_point_count": len(preds[0]["points"]) if preds and preds[0].get("points") else 0,
             "sample_point": preds[0]["points"][0] if preds and preds[0].get("points") else None,
         }
-        _persist_execution("debug_predict", image_bytes.getvalue(),
-                           (file.filename if file else os.path.basename(image_url.split("?")[0])), result)
+        background_tasks.add_task(
+            _persist_execution, "debug_predict", image_bytes.getvalue(),
+            (file.filename if file else os.path.basename(image_url.split("?")[0])), result)
         return result
     except Exception as e:
         logger.exception("debug_predict: trail debug failed")
@@ -738,6 +856,7 @@ async def predict(
     image_url: str = Form(None),
     pdf_url: str = Form(None),
     _: None = Security(require_api_key),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
 ):
     logger.info("predict endpoint hit: file=%s image_url=%s pdf_url=%s",
                 bool(file), bool(image_url), bool(pdf_url))
@@ -746,6 +865,12 @@ async def predict(
     if not file and not image_url and not pdf_url:
         raise HTTPException(status_code=400,
                             detail="Provide file, image_url and/or pdf_url")
+    async with _predict_semaphore:
+        return await _predict_inner(
+            file, image_url, pdf_url, background_tasks)
+
+
+async def _predict_inner(file, image_url, pdf_url, background_tasks):
     try:
         loop = asyncio.get_event_loop()
 
@@ -759,81 +884,106 @@ async def predict(
             logger.debug("predict: fetching image_url")
             src_bytes = (await fetch_image(image_url)).getvalue()
             src_name = os.path.basename(image_url.split("?")[0]) or "input"
-            is_pdf = _looks_like_pdf(src_bytes)   # a URL that actually serves a PDF
+            is_pdf = _looks_like_pdf(src_bytes)
         else:
             logger.debug("predict: reading uploaded file")
             src_bytes = await file.read()
             src_name = file.filename or "input"
             is_pdf = _looks_like_pdf(src_bytes)
 
-        # ── 2. inference image (PNG bytes) + PIL map image, SAME pixel space ──
+        # ── 2. prepare inference image + map_image ──
+        # PDFs: render the page (already capped at PREDICT_PDF_MAX_EDGE).
+        # Images: cap to PREDICT_IMAGE_MAX_EDGE so the models receive a smaller
+        # tensor — faster preprocessing, inference, and trail postprocessing.
+        # scale_back converts inference-space coords → original image space.
         if is_pdf:
-            logger.info("predict: input is a PDF; rendering its single page")
+            logger.info("predict: PDF; rendering page for inference")
             infer_bytes, map_image = await loop.run_in_executor(
-                None, _render_pdf_page, src_bytes)
+                _executor, _render_pdf_page, src_bytes)
+            infer_scale_back = 1.0
         else:
-            logger.debug("predict: input is an image")
-            infer_bytes = src_bytes
-            map_image = Image.open(BytesIO(src_bytes)).convert("RGB")
+            logger.info("predict: image; capping to %dpx max edge for inference",
+                        PREDICT_IMAGE_MAX_EDGE)
+            infer_bytes, map_image, infer_scale_back = await loop.run_in_executor(
+                _executor, _cap_image_for_infer, src_bytes, PREDICT_IMAGE_MAX_EDGE)
 
-        # ── 3. hash / dedup + optional S3 writeback (images only) ──
+        # ── 3 + 4 in parallel: hash computation and model inference are independent ──
+        # Running them concurrently saves the full hash-computation time (~2-5 s)
+        # from the critical path.  For "always_run" mode (the default) this is
+        # always safe.  For skip/reject modes the inference result may be discarded
+        # if the hash already exists, but that is a rare edge case.
         s3_result = {"attempted": False, "reason": "writeback disabled"}
-        if is_pdf:
-            # No EXIF on a PDF; phash the page render instead (sha1 on failure).
-            img_date = None
-            try:
-                img_hash = await loop.run_in_executor(
-                    None, lambda: str(imagehash.phash(map_image)))
-            except Exception:
-                logger.exception("predict: phash of PDF render failed; using sha1")
-                img_hash = hashlib.sha1(src_bytes).hexdigest()
-        else:
-            img_hash, img_date, src_bytes, was_written = await get_or_compute_hash(src_bytes)
-            infer_bytes = src_bytes  # metadata-updated bytes (identical pixels)
+
+        async def _do_hash():
+            if is_pdf:
+                try:
+                    h = await loop.run_in_executor(
+                        _executor, lambda: str(imagehash.phash(map_image)))
+                except Exception:
+                    logger.exception("predict: PDF phash failed; falling back to sha1")
+                    h = hashlib.sha1(src_bytes).hexdigest()
+                return h, None, src_bytes, False
+            return await get_or_compute_hash(src_bytes)
+
+        async def _do_infer():
+            trail_t = run_model_async(_get_rf_model("trail"), BytesIO(infer_bytes), 0.25)
+            icon_t  = run_model_async(_get_rf_model("icon"),  BytesIO(infer_bytes), 0.30)
+            return await asyncio.gather(trail_t, icon_t)
+
+        logger.info("predict: hash + inference running in parallel (is_pdf=%s)", is_pdf)
+        (img_hash, img_date, updated_src, was_written), (trail_output_raw, icon_output_raw) = \
+            await asyncio.gather(_do_hash(), _do_infer())
+
+        if not is_pdf:
+            src_bytes = updated_src
             if was_written and image_url:
-                logger.debug("predict: metadata changed; attempting S3 writeback")
+                logger.debug("predict: metadata written; attempting S3 writeback")
                 s3_result = await writeback_to_s3(image_url, src_bytes)
 
         is_present = await check_and_register_hash(img_hash)
         hash_status = "present" if is_present else "absent"
-        logger.debug("predict: hash=%s status=%s is_pdf=%s", img_hash, hash_status, is_pdf)
+        logger.debug("predict: hash=%s status=%s", img_hash, hash_status)
 
         if is_present and HASH_CHECK_MODE == "reject_if_present":
             raise HTTPException(status_code=409, detail={
                 "message": "Duplicate input — already processed.",
                 "hash": img_hash, "date": img_date, "hash_status": hash_status})
         if is_present and HASH_CHECK_MODE == "skip_if_present":
-            logger.info("predict: duplicate input; skipping inference")
+            logger.info("predict: duplicate; skipping (inference result discarded)")
             return {"hash": img_hash, "date": img_date, "hash_status": hash_status,
                     "s3_writeback": s3_result, "icon_output": [], "trail_output": [],
                     "source_type": "pdf" if is_pdf else "image", "skipped": True}
 
-        # ── 4. icon + trail inference (both run on the PDF render too) ──
-        logger.info("predict: running trail + icon inference (is_pdf=%s)", is_pdf)
-        trail_task = run_model_async(_get_rf_model("trail"), BytesIO(infer_bytes), 0.25)
-        icon_task = run_model_async(_get_rf_model("icon"), BytesIO(infer_bytes), 0.30)
-        trail_output_raw, icon_output_raw = await asyncio.gather(trail_task, icon_task)
-
+        # ── 5. serialize + trail post-processing ──
         trail_serialized = serialize_model_output(trail_output_raw)
-        icon_serialized = serialize_model_output(icon_output_raw)
+        icon_serialized  = serialize_model_output(icon_output_raw)
         trail_block, trail_predictions = extract_trail_data(trail_serialized)
-        icon_block, _ = extract_trail_data(icon_serialized)
+        icon_block, _   = extract_trail_data(icon_serialized)
 
-        # ── 5. trail post-processing (replaces trail_merger.merge_trails) ──
         logger.debug("predict: post-processing %s trail predictions", len(trail_predictions))
         merged_predictions = await loop.run_in_executor(
-            None, postprocess_trails, trail_predictions, map_image)
+            _executor, postprocess_trails, trail_predictions, map_image)
+
+        # ── 6. scale predictions back to original image space ──
+        # map_image (and therefore all predictions) are in inference space.
+        # Multiply by scale_back to convert to the original pixel dimensions.
+        if infer_scale_back != 1.0:
+            logger.debug("predict: scaling coords back by %.3f", infer_scale_back)
+            merged_predictions = _scale_coords(merged_predictions, infer_scale_back)
+            icon_block = _scale_infer_block(icon_block, infer_scale_back)
+
         merged_trail_block = dict(trail_block)
-        # report the render's pixel space so downstream coords line up
         img_info = dict(merged_trail_block.get("image") or {})
-        img_info["width"], img_info["height"] = map_image.size[0], map_image.size[1]
+        # Report dimensions in original image space (not the capped inference size).
+        img_info["width"]  = round(map_image.size[0] * infer_scale_back)
+        img_info["height"] = round(map_image.size[1] * infer_scale_back)
         merged_trail_block["image"] = img_info
         merged_trail_block["predictions"] = merged_predictions
 
         result = {"hash": img_hash, "date": img_date, "hash_status": hash_status,
                   "s3_writeback": s3_result, "source_type": "pdf" if is_pdf else "image",
                   "icon_output": [icon_block], "trail_output": [merged_trail_block]}
-        _persist_execution("predict", src_bytes, src_name, result)
+        background_tasks.add_task(_persist_execution, "predict", src_bytes, src_name, result)
         return result
     except HTTPException:
         raise
@@ -853,6 +1003,7 @@ async def hall_with_booth_predict(
     fp_policy: str = Form(None),
     hall_conf: float = Form(0.50),
     _: None = Security(require_api_key),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
 ):
     """Roboflow hall detection + our adaptive booth pipeline.
 
@@ -893,16 +1044,25 @@ async def hall_with_booth_predict(
 
     try:
         loop = asyncio.get_event_loop()
-        # 1. Booth detection (long pole) — produces booths + the page render.
-        logger.info("hall_with_booth_predict: step 1 booth detection")
-        payload, render_bgr, _viz = await loop.run_in_executor(
-            None, _run_adaptive_booths, src_bytes, src_name, use_pdf, page, fp,
-            True, False)
-        # 2. Hall detection on the downscaled render, scaled back to render space.
-        logger.info("hall_with_booth_predict: step 2 hall detection")
-        hall_predictions = await loop.run_in_executor(
-            None, _hall_predictions_render_space, render_bgr,
-            float(hall_conf), HALL_RASTER_MAX_EDGE)
+
+        # 1. Booth detection (long pole) — semaphore limits concurrent pipeline calls
+        #    so heavy requests queue instead of thrashing CPU/memory.
+        logger.info("hall_with_booth_predict: step 1 booth detection (waiting for slot)")
+        async with _booth_semaphore:
+            logger.info("hall_with_booth_predict: step 1 booth detection (running)")
+            payload, render_bgr, _viz = await loop.run_in_executor(
+                _executor, _run_adaptive_booths, src_bytes, src_name, use_pdf, page, fp,
+                True, False)
+
+        # 2 + 5 in parallel: hall detection and hash computation are independent
+        # once we have the page render from step 1 — run them concurrently.
+        logger.info("hall_with_booth_predict: steps 2+5 in parallel (hall + hash)")
+        hall_predictions, (img_hash, img_date, hash_status) = await asyncio.gather(
+            loop.run_in_executor(
+                _executor, _hall_predictions_render_space,
+                render_bgr, float(hall_conf), HALL_RASTER_MAX_EDGE),
+            _hash_fields(src_bytes, use_pdf, render_bgr),
+        )
 
         # 3. Normalize booths to the production schema.
         logger.info("hall_with_booth_predict: step 3 normalize booths")
@@ -912,14 +1072,10 @@ async def hall_with_booth_predict(
         # what the keep policy filtered out instead of losing them with the temp dir.
         dropped_booths = _normalize_booths(payload.get("dropped", []))
         dropped_detections = {"count": len(dropped_booths), "booths": dropped_booths}
+
         # 4. Build the hall -> booth map.
         logger.info("hall_with_booth_predict: step 4 build hall-booth map")
         hall_booth_map = _build_hall_booth_map(hall_predictions, booth_detections)
-
-        # 5. Compute the hash / date / hash_status trio.
-        logger.info("hall_with_booth_predict: step 5 hash fields")
-        img_hash, img_date, hash_status = await _hash_fields(
-            src_bytes, use_pdf, render_bgr)
 
         result = {
             "hash": img_hash,
@@ -931,7 +1087,8 @@ async def hall_with_booth_predict(
             "dropped_detections": dropped_detections,
             "hall_booth_map": hall_booth_map,
         }
-        _persist_execution("hall_with_booth_predict", src_bytes, src_name, result)
+        background_tasks.add_task(
+            _persist_execution, "hall_with_booth_predict", src_bytes, src_name, result)
         return result
     except HTTPException:
         raise
